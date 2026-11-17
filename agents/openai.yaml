@@ -1,0 +1,13 @@
+interface:
+  display_name: "Herdr Matt Pocock Skills"
+  short_description: "复用环境中已安装的 Matt skills，通过 Herdr 按职责调度工具、模型和思考等级"
+  default_prompt: "使用 $herdr-mattpocock-skills，读取当前 agent 环境中已安装的 Matt 工作流，由秘书确认并归档各身份的工具、模型和思考等级后交给 PM 实施。"
+  icon_small: "./assets/icon.svg"
+  icon_large: "./assets/icon.svg"
+policy:
+  allow_implicit_invocation: true
+  products:
+    - "chatgpt"
+    - "codex"
+    - "api"
+    - "atlas"

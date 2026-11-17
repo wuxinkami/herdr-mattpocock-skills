@@ -1,0 +1,13 @@
+{
+  "name": "herdr-mattpocock-skills",
+  "version": "0.4.0",
+  "description": "Herdr role routing for Matt Pocock skills already installed in the agent environment, with configurable models and secretary-owned kickoff approval.",
+  "type": "module",
+  "repository": { "type": "git", "url": "git+https://github.com/wuxinkami/herdr-mattpocock-skills.git" },
+  "engines": { "node": ">=20" },
+  "bin": { "herdr-mattpocock-skills": "bin/herdr-mattpocock-skills.mjs" },
+  "files": ["SKILL.md", "agents/", "assets/", "references/", "templates/", "bin/", "lib/", "test/", "README.md"],
+  "scripts": { "test": "node --test", "check": "node --check bin/herdr-mattpocock-skills.mjs && node --check lib/installer.mjs" },
+  "keywords": ["agent-skills", "herdr", "matt-pocock", "codex", "claude-code", "cursor", "dsh", "multi-agent"],
+  "license": "MIT"
+}
