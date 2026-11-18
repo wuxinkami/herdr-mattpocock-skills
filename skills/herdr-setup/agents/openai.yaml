@@ -1,0 +1,6 @@
+interface:
+  display_name: "Herdr Setup"
+  short_description: "配置 HMS 项目角色的 CLI、模型与默认思考等级"
+  default_prompt: "使用 $herdr-setup 配置本项目的 agent 工具、模型和思考等级。"
+policy:
+  allow_implicit_invocation: true

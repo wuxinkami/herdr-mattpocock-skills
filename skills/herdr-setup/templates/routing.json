@@ -1,0 +1,173 @@
+{
+  "schemaVersion": 6,
+  "active": false,
+  "tools": {
+    "codex": {
+      "preferredExecutables": {"codex":"codexxx"},
+      "interactive": ["codex","{model}","{effort}"],
+      "headless": ["codex","exec","--json","--ephemeral","--skip-git-repo-check","--sandbox","workspace-write","{model}","{effort}","{prompt}"],
+      "model": ["--model","{value}"],
+      "effort": ["-c","model_reasoning_effort=\"{value}\""],
+      "aliases": ["codexxx"],
+      "source": "https://developers.openai.com/codex/cli/reference"
+    },
+    "claude-code": {
+      "interactive": ["claude","--session-id","{sessionId}","{model}","{effort}"],
+      "headless": ["claude","-p","--output-format","json","--no-session-persistence","{model}","{effort}","{prompt}"],
+      "model": ["--model","{value}"],
+      "effort": ["--effort","{value}"],
+      "aliases": ["claude"],
+      "source": "https://code.claude.com/docs/en/cli-reference"
+    },
+    "gemini": {
+      "interactive": ["agy","{model}","{effort}"],
+      "headless": ["agy","{model}","{effort}","--output-format","json","--print","{prompt}"],
+      "model": ["--model","{value}"],
+      "effort": ["--effort","{value}"],
+      "aliases": ["agy","antigravity","antigravity_cli"],
+      "source": "https://antigravity.google/docs/cli/headless"
+    },
+    "dsh": {
+      "interactive": ["dst","{patch}","--backend","dsh"],
+      "headless": ["dst","run","--output-format","json","{patch}"],
+      "promptInput": "stdin",
+      "aliases": ["dst","dsh-tui"],
+      "patch": {"flag":"--patch","adapter":"dst"},
+      "source": "https://github.com/ccch1mneyyy/dsh-TUI"
+    },
+    "copilot": {
+      "interactive": ["copilot","{model}","{effort}"],
+      "headless": ["copilot","{model}","{effort}","--output-format","json","-p","{prompt}"],
+      "model": ["--model","{value}"],
+      "effort": ["--effort","{value}"],
+      "aliases": ["github-copilot"],
+      "source": "https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-command-reference"
+    },
+    "cursor": {
+      "fallbackExecutables": ["cursor-agent"],
+      "interactive": ["agent","{model}"],
+      "headless": ["agent","-p","--output-format","json","{model}","{prompt}"],
+      "model": ["--model","{value}"],
+      "aliases": ["agent","cursor-agent"],
+      "source": "https://cursor.com/docs/cli/reference/parameters",
+      "modelVariants": {}
+    },
+    "opencode": {
+      "interactive": ["opencode","mini","{model}"],
+      "headless": ["opencode","run","--format","json","{model}","--","{prompt}"],
+      "model": ["--model","{value}"],
+      "modelWithEffort": {"interactive":"{model}#{effort}","headless":"{model}#{effort}"},
+      "source": "https://opencode.ai/docs/models/#variants"
+    },
+    "pi": {
+      "interactive": ["pi","{model}","{effort}"],
+      "headless": ["pi","-p","--mode","json","{model}","{effort}","{prompt}"],
+      "model": ["--model","{value}"],
+      "effort": ["--thinking","{value}"],
+      "source": "https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/cli.md#model-options"
+    },
+    "aider": {
+      "interactive": ["aider","--no-auto-commits","{model}","{effort}"],
+      "headless": ["aider","--no-auto-commits","{model}","{effort}","--message","{prompt}"],
+      "model": ["--model","{value}"],
+      "effort": ["--reasoning-effort","{value}"],
+      "source": "https://aider.chat/docs/config/options.html"
+    },
+    "cline": {
+      "interactive": ["cline","{model}","{effort}"],
+      "headless": ["cline","--json","--auto-approve","false","{model}","{effort}","{prompt}"],
+      "model": ["--model","{value}"],
+      "effort": ["--thinking","{value}"],
+      "source": "https://docs.cline.bot/cli/cli-reference"
+    },
+    "grok": {
+      "interactive": ["grok","{model}","{effort}"],
+      "headless": ["grok","{model}","{effort}","--output-format","json","-p","{prompt}"],
+      "model": ["--model","{value}"],
+      "effort": ["--effort","{value}"],
+      "source": "https://docs.x.ai/build/cli/reference"
+    },
+    "qwen-code": {
+      "interactive": ["qwen","{model}"],
+      "headless": ["qwen","{model}","--output-format","json","-p","{prompt}"],
+      "model": ["--model","{value}"],
+      "aliases": ["qwen"],
+      "source": "https://github.com/QwenLM/qwen-code",
+      "settings": {"env":"QWEN_CODE_SYSTEM_SETTINGS_PATH","base":"qwen-system","values":{"model":{"reasoningEffort":"{effort}"}}}
+    },
+    "kimi": {
+      "interactive": ["kimi","{model}"],
+      "headless": ["kimi","{model}","--output-format","text","-p","{prompt}"],
+      "model": ["--model","{value}"],
+      "source": "https://github.com/MoonshotAI/kimi-code",
+      "env": {"KIMI_MODEL_THINKING_EFFORT":"{effort}"}
+    },
+    "hermes": {
+      "interactive": ["hermes","chat","--cli","{model}","{effort}"],
+      "headless": ["hermes","chat","--cli","{model}","{effort}","--quiet","--query","{prompt}"],
+      "model": ["--model","{value}"],
+      "effort": ["--reasoning","{value}"],
+      "source": "https://github.com/NousResearch/hermes-agent/blob/v0.23.2/hermes_cli/_parser.py"
+    },
+    "goose": {
+      "interactive": ["goose","session","{model}"],
+      "headless": ["goose","run","{model}","--text","{prompt}"],
+      "model": ["--model","{value}"],
+      "source": "https://github.com/block/goose/blob/main/crates/goose-cli/src/cli.rs",
+      "env": {"GOOSE_THINKING_EFFORT":"{effort}"}
+    },
+    "droid": {
+      "interactive": ["droid","{settings}"],
+      "headless": ["droid","exec","{model}","{effort}","--output-format","json","{prompt}"],
+      "model": ["--model","{value}"],
+      "effort": ["--reasoning-effort","{value}"],
+      "source": "https://docs.factory.com/droid-cli/cli-reference",
+      "options": {"interactive":{"settings":{"flag":"--settings","values":{"sessionDefaultSettings":{"model":"{model}","reasoningEffort":"{effort}"}}}}}
+    },
+    "kiro": {
+      "interactive": ["kiro-cli","chat","{model}","{effort}"],
+      "headless": ["kiro-cli","chat","--no-interactive","{model}","{effort}","{prompt}"],
+      "model": ["--model","{value}"],
+      "effort": ["--effort","{value}"],
+      "aliases": ["kiro-cli"],
+      "source": "https://kiro.dev/docs/cli/headless/"
+    },
+    "qoder": {
+      "fallbackExecutables": ["qodercli"],
+      "interactive": ["qoder","{model}","{effort}"],
+      "headless": ["qoder","{model}","{effort}","--print","--output-format","json","{prompt}"],
+      "model": ["--model","{value}"],
+      "effort": ["--reasoning-effort","{value}"],
+      "aliases": ["qodercli"],
+      "source": "https://docs.qoder.com/cli/cli-reference"
+    },
+    "mistral-vibe": {
+      "interactive": ["vibe"],
+      "headless": ["vibe","{model}","{effort}","--output","json","--prompt","{prompt}"],
+      "model": ["--model","{value}"],
+      "aliases": ["vibe"],
+      "source": "https://docs.mistral.ai/vibe/code/cli/work-with-cli",
+      "options": {"interactive":{"env":{"VIBE_ACTIVE_MODEL":"{model}"},"modelVariants":{}}},
+      "effort": ["--thinking","{value}"]
+    },
+    "amp": {
+      "interactive": ["amp","{model}","{effort}"],
+      "headless": ["amp","{model}","{effort}","-x","{prompt}"],
+      "model": ["--model","{value}"],
+      "effort": ["--effort","{value}"],
+      "options": {"headless":{"effortNeedsModel":true}},
+      "source": "https://ampcode.com/docs/markdown/model-selector"
+    }
+  },
+  "roles": {
+    "secretary": {"tool":"current","model":"","effort":"inherit","carrier":"current"},
+    "pm": {"tool":"","model":"","effort":"high","carrier":"herdr","place":"tab"},
+    "wayfinder": {"tool":"","model":"","effort":"high","carrier":"herdr","place":"split"},
+    "frontend": {"tool":"","model":"","effort":"high","carrier":"herdr","place":"tab"},
+    "backend": {"tool":"","model":"","effort":"high","carrier":"herdr","place":"tab"},
+    "searcher": {"tool":"","model":"","effort":"high","carrier":"auto"},
+    "reviewer": {"tool":"","model":"","effort":"high","carrier":"auto"},
+    "designer": {"tool":"","model":"","effort":"high","carrier":"auto"},
+    "merger": {"tool":"","model":"","effort":"high","carrier":"auto"}
+  }
+}

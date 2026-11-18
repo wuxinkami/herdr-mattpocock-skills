@@ -3,9 +3,13 @@
   "version": "1.0.0",
   "description": "Route Matt Pocock skill workflows through Herdr: per-role agent tool, model, effort, and explicit-panel or anonymous execution, without changing the workflows.",
   "type": "module",
+  "scripts": {
+    "check": "node --check skills/herdr-mattpocock-skills/scripts/hms.mjs && node --check skills/herdr-mattpocock-skills/scripts/routing.mjs && node --check lib/install.mjs && node --check skills/herdr-setup/scripts/setup.mjs",
+    "test": "node --test tests/*.test.mjs"
+  },
   "engines": { "node": ">=20" },
   "bin": { "herdr-mattpocock-skills": "bin/cli.mjs" },
-  "files": ["SKILL.md", "agents/", "roles/", "references/", "templates/", "scripts/", "bin/", "lib/", "README.md", "LICENSE"],
+  "files": ["skills/", "bin/", "lib/", "README.md", "docs/产品文档/HMS.md", "LICENSE"],
   "keywords": ["agent-skills", "herdr", "matt-pocock", "codex", "claude-code", "cursor", "dsh", "multi-agent"],
   "license": "MIT"
 }
