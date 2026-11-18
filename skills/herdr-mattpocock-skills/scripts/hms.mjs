@@ -452,18 +452,20 @@ function prepareArgv(snap, r, mode, prompt) {
 
 function dispatchPrompt(snap, { role, task, parent, self, cwd, body }) {
   const roleFile = path.join(SKILL_DIR, 'roles', role + '.md');
+  const duties = /^[a-z][\w-]*$/.test(role) && fs.existsSync(roleFile)
+    ? fs.readFileSync(roleFile, 'utf8').replace(/^#[^\r\n]*\r?\n/, '').trim()
+    : '';
   const projectRules = path.join(snap.project, 'AGENTS.md');
   const hms = 'node ' + shellQuote(HMS);
-  const lines = [
-    `${role} · ${task}`,
-    fs.existsSync(roleFile) ? `职责：${roleFile}` : '职责见派工正文。',
-    `Herdr 约定：${path.join(SKILL_DIR, 'AGENTS.md')}`,
-    `HMS（${snap.mode === 'complex' ? '团队' : '简单'}模式）：${hms}　--context ${encodeContext(snap)}`,
-  ];
-  if (fs.existsSync(projectRules)) lines.push(`项目约定：${projectRules}`);
+  const lines = [`${role} · ${task}`];
+  if (duties) lines.push(duties);
+  if (fs.existsSync(projectRules)) lines.push(`仅当任务属于该主仓或其 worktree 且宿主尚未加载时读 ${projectRules}。`);
   if (cwd) lines.push(`本任务工作目录：${cwd}`);
+  lines.push(`如需再派工，用 ${hms}，沿用${snap.mode === 'complex' ? '团队' : '简单'}模式参数 --context ${encodeContext(snap)}`);
+  if (self) lines.push(`显式再派工加 --parent ${self}`);
+  lines.push(`仅在需要调度且当前上下文缺少命令用法时读 ${path.join(SKILL_DIR, 'SKILL.md')}。`);
   if (parent) {
-    lines.push(`再派工用 --parent ${self}。结果直回发起者，状态可填 completed、blocked、failed。`,
+    lines.push('执行后直回发起者，状态可填 completed、blocked、failed。',
       `${hms} notify --to ${parent} --task ${shellQuote(task)} --role ${shellQuote(role)} --status completed --summary '<结果>'`);
   } else {
     lines.push('直接返回结果给调用方。');

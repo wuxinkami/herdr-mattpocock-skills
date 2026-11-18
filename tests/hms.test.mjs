@@ -97,6 +97,8 @@ test('显式面板通过 Herdr 直接收到原文并登记原生 ID，不用派�
   const dispatched = f.sent().find(c => c[0] === 'agent' && c[1] === 'prompt');
   assert.ok(dispatched[3].endsWith(body));
   assert.ok(dispatched[3].includes(`--context ${r.context}`));
+  assert.match(dispatched[3], /纯前端票由你主责/);
+  assert.doesNotMatch(dispatched[3], /roles\/frontend\.md/);
   assert.ok(!dispatched[3].includes('读取派工文件'));
   assert.ok(f.read(r).includes('| visible-session | mock | observed-model | high |'));
   assert.deepEqual(files(f.project), [r.record, f.config]);
@@ -111,7 +113,10 @@ test('匿名成功与失败调用都登记，输出直接返回并保留退出�
     assert.equal(result.exit, fail ? 7 : 0);
     assert.ok(result.stdout.includes('anonymous-session'));
     const events = result.stdout.trim().split('\n').map(JSON.parse);
-    assert.ok(events.at(-1).item.text.endsWith(body));
+    const prompt = events.at(-1).item.text;
+    assert.ok(prompt.endsWith(body));
+    assert.match(prompt, /承担搜索、代码探索或 research/);
+    assert.doesNotMatch(prompt, /roles\/searcher\.md/);
     assert.ok(f.read(r).includes('| anonymous-session | mock | actual-model | high |'));
     assert.deepEqual(files(f.project), [r.record, f.config]);
   }

@@ -10,4 +10,4 @@ npx herdr-mattpocock-skills install --target agents --project /path/to/project
 
 选宿主实际读取的技能目录，共享路径只安装一次。卸载共享副本时选择实际目录对应的目标。引用 `$herdr-mattpocock-skills` 默认简单模式，本轮要求团队、多 agent 或使用 wayfinder 时转团队。口头覆盖仅本轮生效。
 
-[HMS](skills/herdr-mattpocock-skills/SKILL.md) · [herdr-setup](skills/herdr-setup/SKILL.md) · [Herdr 操作](skills/herdr-mattpocock-skills/AGENTS.md) · [角色职责](skills/herdr-mattpocock-skills/roles/)
+[HMS 操作手册](skills/herdr-mattpocock-skills/SKILL.md) · [项目路由配置](skills/herdr-setup/SKILL.md)
