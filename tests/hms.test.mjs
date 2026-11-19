@@ -442,6 +442,12 @@ function multiSessionFixture(t, { sessions, roles = {}, env: extraEnv = {} } = {
       const pane = findPane(a[2]);
       if (!pane) fail('pane_not_found', 'pane not found');
       result = { pane };
+    } else if (a[0] === 'pane' && a[1] === 'read') {
+      const pane = findPane(a[2]);
+      if (!pane) fail('pane_not_found', 'pane not found');
+      const lines = Number(a[a.indexOf('--lines') + 1]);
+      console.log((pane.visible ?? '').split('\\n').slice(-lines).join('\\n'));
+      process.exit(0);
     } else if (a[0] === 'pane' && a[1] === 'split') {
       const parent = findPane(a[a.indexOf('--pane') + 1]);
       if (!parent) fail('pane_not_found', 'parent pane not found');
@@ -525,10 +531,10 @@ function multiSessionFixture(t, { sessions, roles = {}, env: extraEnv = {} } = {
     delete baseEnv[key];
   }
   Object.assign(baseEnv, extraEnv);
-  const run = (args, { expected = 0, env: overrideEnv = {} } = {}) => {
+  const run = (args, { expected = 0, env: overrideEnv = {}, script = hms, input } = {}) => {
     const merged = { ...baseEnv, ...overrideEnv };
     for (const [k, v] of Object.entries(merged)) if (v === undefined) delete merged[k];
-    const res = spawnSync(process.execPath, [hms, ...args, '--project', project], { cwd: project, env: merged, encoding: 'utf8' });
+    const res = spawnSync(process.execPath, [script, ...args, '--project', project], { cwd: project, env: merged, encoding: 'utf8', input });
     assert.equal(res.status, expected, res.stderr || res.stdout);
     return expected === 0 || res.stdout ? JSON.parse(res.stdout) : res;
   };
@@ -542,6 +548,54 @@ function multiSessionFixture(t, { sessions, roles = {}, env: extraEnv = {} } = {
   };
   return { dir, project, sockets, run, calls, clearCalls, state, mutateState };
 }
+
+test('手动 Codex 的启动 hook 和 HMS 从实时状态栏核对自身，在共享 app-server 下也只在自己的标签页分屏', t => {
+  const mainThread = '01a10000-0000-7000-8000-000000000001';
+  const defaultThread = '01a10000-0000-7000-8000-000000000002';
+  const footer = id => `› Ask Codex to do anything\n\n  ${id} · Context 71% left\n  ← for agents · ? for shortcuts`;
+  const codex = { pane_id: 'w1:p4', workspace_id: 'w1', agent: 'codex', agent_status: 'idle' };
+  const f = multiSessionFixture(t, { sessions: {
+    default: { panes: [{ ...codex, tab_id: 'w1:t4', terminal_id: 'term-default',
+      agent_session: { value: mainThread }, visible: footer(defaultThread) }] },
+    main: { panes: [{ ...codex, tab_id: 'w1:t9', terminal_id: 'term-main',
+      agent_session: { value: defaultThread }, visible: footer(mainThread) }] },
+  } });
+  const env = { CODEX_THREAD_ID: mainThread, HERDR_SOCKET_PATH: f.sockets.default,
+    HERDR_SESSION: 'default', HERDR_PANE_ID: 'w1:p4', HERDR_TAB_ID: 'w1:t4' };
+  const team = f.run(['init', '--mode', 'complex', '--title', '核对秘书面板'], { env });
+  const spawn = ['spawn', 'wayfinder', '--context', team.context, '--task', 'coordinates', '--prompt', '验证位于发起面板旁'];
+  const where = f.run(['where'], { env });
+  assert.deepEqual([where.herdrSession, where.herdrSocket, where.workspace, where.tab, where.pane, where.terminalId, where.sessionId],
+    ['main', f.sockets.main, 'w1', 'w1:t9', 'w1:p4', 'term-main', mainThread]);
+  assert.equal(decodeAddress(where.address).session, undefined);
+  const child = f.run(spawn, { env });
+  assert.deepEqual([child.herdrSocket, child.workspace, child.tab], [f.sockets.main, 'w1', 'w1:t9']);
+  const split = f.calls().find(c => c.args[0] === 'pane' && c.args[1] === 'split');
+  assert.deepEqual([split.socket, split.herdrSession, ...split.args.slice(2, 6)],
+    [f.sockets.main, null, '--pane', 'w1:p4', '--direction', 'right']);
+  const notifyAddress = /notify --to (hms:[A-Za-z0-9_-]+)/.exec(f.state().sessions.main.panes.find(p => p.pane_id === child.pane).prompts[0])[1];
+  assert.equal(f.run(['notify', '--to', notifyAddress, '--task', 'coordinates', '--role', 'wayfinder', '--status', 'completed', '--summary', '完成'], { env }).to, 'w1:p4');
+
+  const script = path.join(path.dirname(hms), 'codex-session-start.mjs');
+  const hookInput = JSON.stringify({ hook_event_name: 'SessionStart', session_id: mainThread });
+  const hook = f.run([], { script, input: hookInput, env: { ...env, CODEX_THREAD_ID: defaultThread } });
+  assert.match(hook.hookSpecificOutput.additionalContext, /会话 main，工作区 w1，标签页 w1:t9，面板 w1:p4，终端 term-main/);
+  const defaultWhere = f.run(['where'], { env: { ...env, CODEX_THREAD_ID: defaultThread, HERDR_SOCKET_PATH: f.sockets.main, HERDR_SESSION: 'main' } });
+  assert.deepEqual([defaultWhere.herdrSocket, defaultWhere.tab, defaultWhere.sessionId], [f.sockets.default, 'w1:t4', defaultThread]);
+
+  f.clearCalls();
+  assert.match(f.run([...spawn, '--herdr-session', 'default', '--parent', 'w1:p4'], { expected: 1, env }).stderr, /不一致/);
+  assert.match(f.run([...spawn, '--session-id', defaultThread], { expected: 1, env }).stderr, /不一致/);
+  f.mutateState(s => { s.sessions.default.panes[0].visible = footer(mainThread); });
+  assert.match(f.run(spawn, { expected: 1, env }).stderr, /匹配多个 Herdr 面板/);
+  assert.deepEqual(f.run([], { script, input: hookInput, env }), {});
+  f.mutateState(s => {
+    s.sessions.default.panes[0].visible = `${mainThread}\n${footer(defaultThread)}`;
+    s.sessions.main.panes[0].visible = footer(`${mainThread.slice(0, 29)}...`);
+  });
+  assert.match(f.run([...spawn, '--herdr-session', 'default', '--parent', 'w1:p4'], { expected: 1, env }).stderr, /状态栏未显示本线程的完整 ID/);
+  assert.ok(!f.calls().some(c => c.args[0] === 'pane' && c.args[1] === 'split'));
+});
 
 test('双会话共存时按目标 socket 分屏启动 wayfinder，允许跨会话同名面板与同名 agent', t => {
   const f = multiSessionFixture(t, {

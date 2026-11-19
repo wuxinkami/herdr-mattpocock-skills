@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$(git rev-parse --show-toplevel)/hooks/herdr-session-start.mjs\"",
+            "timeout": 15,
+            "statusMessage": "核对当前 Herdr 面板"
+          }
+        ]
+      }
+    ]
+  }
+}

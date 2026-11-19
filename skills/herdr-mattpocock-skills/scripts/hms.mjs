@@ -13,6 +13,7 @@ export const SKILL_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url
 const SETUP_DIR = path.join(path.dirname(SKILL_DIR), 'herdr-setup');
 const HMS = path.join(SKILL_DIR, 'scripts', 'hms.mjs');
 const NAME_RE = /^[a-z][a-z0-9_-]{0,31}$/;
+const CODEX_THREAD_RE = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
 const DEFAULT_MAIN = ['secretary', 'pm', 'backend'];
 const PANEL_ROLES = new Set(['pm', 'frontend', 'backend', 'wayfinder']);
 const ROLE_USE = {
@@ -483,6 +484,10 @@ function requireHerdr() {
 
 function herdr(args, { socket, allowFail = false, timeout } = {}) {
   const env = { ...process.env };
+  if (args[0] === 'session' && args[1] === 'list') {
+    delete env.HERDR_SOCKET_PATH;
+    delete env.HERDR_SESSION;
+  }
   if (socket) {
     env.HERDR_SOCKET_PATH = socket;
     delete env.HERDR_SESSION;
@@ -492,7 +497,10 @@ function herdr(args, { socket, allowFail = false, timeout } = {}) {
   const text = (ok ? r.stdout : r.stderr || r.stdout)?.trim() ?? '';
   let reply = {};
   if (text) {
-    try { reply = JSON.parse(text); } catch { reply = { raw: text }; }
+    if (args[0] === 'pane' && args[1] === 'read') reply = { raw: text };
+    else {
+      try { reply = JSON.parse(text); } catch { reply = { raw: text }; }
+    }
   }
   if (ok) return reply;
   if (allowFail) return null;
@@ -569,19 +577,27 @@ function panelTarget(socket, ref, { allowShell = false } = {}) {
   const agent = agentInfo(socket, pane);
   const live = agent ?? (allowShell && herdr(['pane', 'get', pane], { socket, allowFail: true })?.result?.pane);
   if (!live?.pane_id) throw new Error(`面板 ${pane} 在 Herdr socket ${socket} 不可用，消息未送达`);
-  if (ref.bound && (live.pane_id !== pane || (ref.terminal && live.terminal_id !== ref.terminal) ||
-      (live.agent && ref.tool && live.agent !== ref.tool) ||
-      (agent && (agent.agent_status !== 'unknown' || agent.agent) && ref.session && agent.agent_session?.value !== ref.session))) {
-    throw new Error(`Herdr socket ${socket} 的面板 ${pane} 会话身份已变更`);
-  }
+  const sessionId = agent && (agent.agent_status !== 'unknown' || agent.agent) ? agent.agent_session?.value ?? null : undefined;
+  checkPanelBinding(socket, ref, live, sessionId);
   return live;
 }
 
-function ancestorPids(pid = process.pid) {
+function checkPanelBinding(socket, ref, live, sessionId) {
+  if (ref.bound && (live.pane_id !== ref.pane || (ref.terminal && live.terminal_id !== ref.terminal) ||
+      (live.agent && ref.tool && live.agent !== ref.tool) || (sessionId !== undefined && ref.session && sessionId !== ref.session))) {
+    throw new Error(`Herdr socket ${socket} 的面板 ${ref.pane} 会话身份已变更`);
+  }
+}
+
+function ancestorPids(pid = process.pid, stopAtCodexServer = false) {
   const ids = new Map();
   while (pid > 1 && !ids.has(pid)) {
-    ids.set(pid, ids.size);
     try {
+      if (stopAtCodexServer) {
+        const [exe, ...args] = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0');
+        if (path.basename(exe) === 'codex' && args.includes('app-server')) break;
+      }
+      ids.set(pid, ids.size);
       const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
       pid = Number(stat.slice(stat.lastIndexOf(')') + 2).split(' ')[1]);
     } catch { break; }
@@ -623,6 +639,42 @@ function agentList(socket) {
   return herdr(['agent', 'list'], { socket, allowFail: true })?.result?.agents ?? [];
 }
 
+export function findCodexPanel(threadId) {
+  if (!CODEX_THREAD_RE.test(threadId ?? '')) return null;
+  const deadline = Date.now() + 5_000;
+  const query = (args, socket) => {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new Error('核对 Codex 面板超时');
+    return herdr(args, { socket, timeout: Math.min(remaining, 1_500) });
+  };
+  const { sessions } = query(['session', 'list', '--json']);
+  if (!Array.isArray(sessions)) throw new Error('Herdr 未返回会话列表，无法核对 Codex 面板');
+  let match;
+  for (const { name, socket_path: socket, running } of sessions) {
+    if (!running) continue;
+    if (!path.isAbsolute(socket ?? '')) throw new Error(`Herdr 会话 ${name} 缺少可核对的 socket`);
+    const agents = query(['agent', 'list'], socket).result?.agents;
+    if (!Array.isArray(agents)) throw new Error(`Herdr 会话 ${name} 未返回 agent 列表`);
+    for (const live of agents) {
+      if (live.agent !== 'codex') continue;
+      const { raw } = query(['pane', 'read', live.pane_id, '--source', 'visible', '--lines', '2'], socket);
+      if (!raw?.split(/\r?\n/).some(line => line.trim().split(' · ').includes(threadId))) continue;
+      if (match) {
+        throw new Error(`Codex 线程 ${threadId} 匹配多个 Herdr 面板（${match.herdrSession}/${match.live.pane_id}、${name}/${live.pane_id}）`);
+      }
+      match = { socket, herdrSession: name, live, sessionId: threadId };
+    }
+  }
+  if (!match) return null;
+  const { live, socket } = match;
+  const current = query(['pane', 'get', live.pane_id], socket).result?.pane;
+  if (current?.agent !== 'codex' || !live.terminal_id || current.terminal_id !== live.terminal_id || current.pane_id !== live.pane_id ||
+      !current.tab_id || current.tab_id !== live.tab_id || !current.workspace_id || current.workspace_id !== live.workspace_id) {
+    throw new Error(`核对时 Herdr 面板 ${match.herdrSession}/${live.pane_id} 的终端或标签页已变更，请重试`);
+  }
+  return match;
+}
+
 function callerDistance(socket, pane, ancestors) {
   const info = paneProcessInfo(socket, pane);
   if (!info) return Infinity;
@@ -630,9 +682,19 @@ function callerDistance(socket, pane, ancestors) {
   return Math.min(...pids.map(pid => ancestors.get(pid) ?? Infinity));
 }
 
-function verifyCaller(o, ref, selected, { socket, live }) {
+function verifyCaller(o, ref, selected, { socket, live, sessionId, herdrSession }) {
   if (selected && selected !== socket) {
-    throw new Error(`指定的 Herdr socket ${selected} 与当前进程所属的 socket ${socket}（面板 ${live.pane_id}）不一致`);
+    throw new Error(`指定的 Herdr socket ${selected} 与发起者的 socket ${socket}（面板 ${live.pane_id}）不一致`);
+  }
+  if (sessionId) {
+    if (ref && ref.pane !== live.pane_id && ref.pane !== live.name) {
+      throw new Error(`--parent ${ref.pane} 与发起面板 ${live.pane_id} 不一致（Herdr 会话 ${herdrSession}，socket ${socket}）`);
+    }
+    if (ref) checkPanelBinding(socket, ref, live, sessionId);
+    verifyCallerSession(o, socket, live, sessionId);
+    // 回报地址只使用 Herdr 能核对的字段。当前线程 ID 来自 Codex 的状态栏。
+    const parent = live.agent_session?.value === sessionId ? live : { ...live, agent_session: undefined };
+    return { socket, live: parent, sessionId, herdrSession };
   }
   const parent = ref ? panelTarget(socket, ref) : agentInfo(socket, live.pane_id) ?? live;
   if (parent.pane_id !== live.pane_id) {
@@ -642,22 +704,23 @@ function verifyCaller(o, ref, selected, { socket, live }) {
   return { socket, live: parent };
 }
 
-function verifyCallerSession(o, socket, pane) {
+function verifyCallerSession(o, socket, pane, actual = pane.agent_session?.value) {
   const native = pane.agent === 'codex' ? process.env.CODEX_THREAD_ID
     : ['claude', 'claude-code'].includes(pane.agent) ? process.env.CLAUDE_SESSION_ID : undefined;
   const expected = o.sessionId ?? native;
-  const actual = pane.agent_session?.value;
   if (expected && actual && expected !== actual) {
     throw new Error(`发起会话 ID ${expected} 与面板 ${pane.pane_id} 的原生会话 ID ${actual} 不一致（Herdr socket ${socket}）`);
   }
 }
 
-function callerPanel(o) {
+function callerPanel(o, { checkCodex = false } = {}) {
   if (!onPath('herdr')) return null;
   const ref = o.parent ? panelRef(o.parent) : undefined;
   const selected = selectedSocket(o, ref);
   const inherited = inheritedSocket();
-  const ancestors = ancestorPids();
+  const threadId = process.env.CODEX_THREAD_ID;
+  const codex = CODEX_THREAD_RE.test(threadId ?? '');
+  const ancestors = ancestorPids(process.pid, true);
   if (inherited && process.env.HERDR_PANE_ID) {
     const live = herdr(['pane', 'current', '--current'], { socket: inherited, allowFail: true })?.result?.pane;
     if (live && Number.isFinite(callerDistance(inherited, live.pane_id, ancestors))) {
@@ -665,13 +728,18 @@ function callerPanel(o) {
     }
   }
 
-  // 共享 app-server 可能继承其他客户端的面板环境。先查进程归属，再接受显式会话。
+  // 共享 app-server 可能继承其他客户端的面板环境，进程归属在 app-server 处截断。
   const sockets = new Set([inherited, selected, ...herdrSessions().map(s => s.socket_path)].filter(Boolean));
   const matches = [...sockets].flatMap(socket => agentList(socket).map(live =>
     ({ socket, live, distance: callerDistance(socket, live.pane_id, ancestors) })))
     .filter(m => Number.isFinite(m.distance)).sort((a, b) => a.distance - b.distance);
   if (matches.length && matches[0].distance !== matches[1]?.distance) {
     return verifyCaller(o, ref, selected, matches[0]);
+  }
+  if (codex && checkCodex) {
+    const visible = findCodexPanel(threadId);
+    if (visible) return verifyCaller(o, ref, selected, visible);
+    if (!(ref?.managed === true && ref.socket && ref.terminal)) return null;
   }
   if (!selected || (!ref && !o.sessionId)) return null;
 
@@ -693,8 +761,17 @@ function callerPanel(o) {
 }
 
 function senderPanel(o) {
-  const caller = callerPanel(o);
-  if (caller) return caller;
+  const caller = callerPanel(o, { checkCodex: true });
+  if (caller) {
+    const { socket, live } = caller;
+    if (!live.agent || !live.tab_id || !live.workspace_id || !live.terminal_id) {
+      throw new Error(`Herdr socket ${socket} 的面板 ${live.pane_id} 缺少发起 agent、终端或标签页坐标`);
+    }
+    return caller;
+  }
+  if (CODEX_THREAD_RE.test(process.env.CODEX_THREAD_ID ?? '')) {
+    throw new Error('无法确认发起面板：Herdr 可见的 Codex 状态栏未显示本线程的完整 ID。请在当前 Codex 的 /statusline 启用 thread-id 并移到最前，确认面板足够宽，重试 hms where');
+  }
   const inherited = process.env.HERDR_SOCKET_PATH ?? process.env.HERDR_SESSION;
   throw new Error(`无法确认发起面板${inherited ? `（进程继承 ${inherited}，面板 ${process.env.HERDR_PANE_ID ?? '未知'}）` : ''}。请用 --herdr-session <名称> --parent <面板 ID>，或传入带 socket 的 --parent 地址`);
 }
@@ -857,10 +934,9 @@ function panelDirectory(socket, agent) {
 
 function cmdWhere(o) {
   requireHerdr();
-  const { socket, live } = senderPanel(o);
-  const herdrSession = herdrSessions().find(s => s.socket_path === socket)?.name ?? null;
+  const { socket, live, sessionId, herdrSession = herdrSessions().find(s => s.socket_path === socket)?.name ?? null } = senderPanel(o);
   out({ herdrSession, herdrSocket: socket, workspace: live.workspace_id, tab: live.tab_id, pane: live.pane_id,
-    sessionId: live.agent_session?.value ?? null, address: panelAddress(socket, live) });
+    terminalId: live.terminal_id, sessionId: sessionId ?? live.agent_session?.value ?? null, address: panelAddress(socket, live) });
 }
 
 function cmdSpawn(o) {
@@ -874,9 +950,6 @@ function cmdSpawn(o) {
   const r = roleOf(snap, role, 'herdr', o.fresh);
   const record = recordPath(snap);
   const { socket, live: parent } = senderPanel(o);
-  if (!parent.agent || !parent.tab_id || !parent.workspace_id) {
-    throw new Error(`Herdr socket ${socket} 的面板 ${parent.pane_id} 缺少发起 agent 或标签页信息`);
-  }
   const parentAddress = panelAddress(socket, parent, false, o.task);
   const singleton = !o.fresh && singletonRole(snap.mode, role);
   const name = singleton ? singletonName(snap.roundId, role, r) : (o.name ?? `hms-${crypto.randomUUID().slice(0, 8)}`);
@@ -1179,7 +1252,7 @@ const HELP = `hms — Herdr 角色调度
   ls --record 表路径 [--herdr-session NAME]
   argv ROLE [--context C] [--headless] [--fresh]          预览实际工具命令
 
-spawn 在发起者所属的标签页分屏。--herdr-session 指定 Herdr 会话名，--session-id 指 agent 原生会话 ID。
+where 核对当前发起面板，spawn 重新核对并在同一标签页分屏。--herdr-session 指定 Herdr 会话名，--session-id 指 agent 原生会话 ID。
 --fresh 用项目的 frontend 或 backend 配置，在本票 worktree 开显式新面板。--project DIR 指定主项目。`;
 
 export function main(argv) {

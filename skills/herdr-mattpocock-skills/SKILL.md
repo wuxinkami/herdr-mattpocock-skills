@@ -21,6 +21,8 @@ team_opts=(--mode complex --on pm,frontend --off wayfinder,backend,searcher,revi
 hms resolve "${team_opts[@]}"
 # 用户确认后，沿用刚展示的选项
 context=$(hms init "${team_opts[@]}" --title "$title" --confirmed "$reply" | jq -er '.context')
+hms where
+# 核对发起面板坐标后派工
 hms spawn pm --context "$context" --task "$task" --prompt "$prompt"
 ```
 
@@ -30,7 +32,11 @@ hms spawn pm --context "$context" --task "$task" --prompt "$prompt"
 
 ## 派工与回报
 
+秘书或简单模式主 agent 每次开显式面板前都先运行 `hms where`，确认输出里的 `herdrSession`、`workspace`、`tab` 和 `pane` 是自己的坐标，再用 `hms spawn` 派工。`spawn` 会重新核对并在该面板旁分屏。`where` 失败时按提示修正后重试。
+
 ```bash
+hms where
+# 核对发起面板坐标后派工
 hms spawn "$role" --context "$context" --task "$task" --prompt "$prompt"
 hms prompt "$address" --prompt "$prompt"
 hms notify --to "$reply_address" --task "$task" --role "$role" --status completed --summary "$summary"
@@ -56,10 +62,5 @@ hms record add --context "$context" --tool "$tool" --session-id "$id" --model "$
 - 用 `hms resolve --context "$context"` 加 `--set 角色.tool=CLI`、`--set 角色.model=型号`、`--set 角色.effort=等级` 或 `--on`、`--off` 预览变更。临时换 CLI 沿用项目为该 CLI 配置的唯一型号，否则问一次，可选 `default`。
 - 用 `hms record update --context "$context" --confirmed "$reply"` 加相同选项更新。已经确认的团队只补确认变化项，用户点名即确认。只登记答复用 `hms record confirm --context "$context" --confirmed "$reply"`。以后续返回的 context 为准。
 - 简单模式转团队用 `hms record update --context "$context" --mode complex` 并带上所需角色，沿用临时配置。展示配置并确认，原前端交接后再开 PM。团队每轮一张 `.agents/herdr/session/<时间戳>-<标题>.md`，登记会话 ID、工具、实际模型和思考等级。升级前的调用无需补记，未知值照实填。
-- 用 `hms where` 核对发起面板的 Herdr 会话、工作区和标签页。共享 app-server 中无法自动定位时，从 `herdr session list` 和指定会话的面板列表核对当前标签页。给 `spawn` 一并传入 `--herdr-session` 和 `--parent`，或将 `where` 返回的 `address` 作为 `--parent`。
-  ```bash
-  herdr --session "$herdr_session" pane list
-  hms where --herdr-session "$herdr_session" --parent "$pane"
-  ```
-  `--herdr-session` 是 Herdr 会话名，如 `main`。`--parent` 指向面板，如 `w1:p4`。`--session-id` 用于核对 Codex 等 agent 的原生会话 ID。旧地址缺少 socket 时，可用 `--herdr-session` 指定对应会话。
+- 手动启动的 Codex 使用共享 app-server 时，HMS 用当前线程 ID 匹配各 Herdr 会话的可见状态栏。定位失败时请用户在当前 Codex 的 `/statusline` 启用 `thread-id` 并移到最前，让完整 ID 显示在面板底部，然后运行 `hms where`。`--herdr-session` 是 Herdr 会话名，如 `main`。`--parent` 接受 `where` 返回的地址或面板 ID。`--session-id` 是 agent 的原生会话 ID。旧地址缺少 socket 时，可用 `--herdr-session` 指定对应会话。
 - 查启动参数用 `hms argv "$role" --context "$context"`，可加 `--headless` 或 `--fresh`。查团队表及在线成员用 `hms ls --record "$record"`，可用 `--herdr-session "$herdr_session"` 指定会话。
