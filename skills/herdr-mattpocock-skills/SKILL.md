@@ -37,7 +37,7 @@ hms notify --to "$reply_address" --task "$task" --role "$role" --status complete
 hms close "$address"
 ```
 
-- `spawn` 返回 `address` 供续发或关闭。`delivered: false` 时先处理面板等待项，再用 `prompt` 补发返回的完整正文。成员再派工用随任务收到的 `--parent`。票级新实现者加 `--fresh --cwd "$worktree"`，沿用本轮 context。查主项目配置加 `--project "$project"`。
+- `spawn` 在发起面板所属的 Herdr 会话、工作区和标签页分屏。返回的 `address` 绑定 socket 和面板，用于续发或关闭。`delivered: false` 时先处理面板等待项，再用 `prompt` 补发返回的完整正文。成员再派工用随任务收到的 `--parent`。票级新实现者加 `--fresh --cwd "$worktree"`，沿用本轮 context。查主项目配置加 `--project "$project"`。
 - 用任务正文附带的 `notify` 回报，状态可填 `completed`、`blocked`、`failed`。发起者等待审批时最多等一分钟，超时保留面板和结果供重发。
 - 等发送方结束回合后关闭。团队 PM 关自己的成员，秘书关 PM 和逐票 wayfinder。借用面板保留，明确移交管理时用 `hms close "$pane" --takeover`。
 
@@ -55,9 +55,11 @@ hms record add --context "$context" --tool "$tool" --session-id "$id" --model "$
 
 - 用 `hms resolve --context "$context"` 加 `--set 角色.tool=CLI`、`--set 角色.model=型号`、`--set 角色.effort=等级` 或 `--on`、`--off` 预览变更。临时换 CLI 沿用项目为该 CLI 配置的唯一型号，否则问一次，可选 `default`。
 - 用 `hms record update --context "$context" --confirmed "$reply"` 加相同选项更新。已经确认的团队只补确认变化项，用户点名即确认。只登记答复用 `hms record confirm --context "$context" --confirmed "$reply"`。以后续返回的 context 为准。
-- 简单模式转团队用 `hms record update --context "$context" --mode complex` 并带上所需角色，沿用临时配置。展示配置并确认，原前端交接后再开 PM。团队每轮一张 `.agents/herdr/<时间戳>-<标题>.md`，登记会话 ID、工具、实际模型和思考等级。升级前的调用无需补记，未知值照实填。
-- 定位发起面板失败时，用 `--session-id "$session_id"` 重试，或用 `herdr agent get "$pane"` 核对后传 `--parent "$pane"`。按会话查面板时可用下列命令。
+- 简单模式转团队用 `hms record update --context "$context" --mode complex` 并带上所需角色，沿用临时配置。展示配置并确认，原前端交接后再开 PM。团队每轮一张 `.agents/herdr/session/<时间戳>-<标题>.md`，登记会话 ID、工具、实际模型和思考等级。升级前的调用无需补记，未知值照实填。
+- 用 `hms where` 核对发起面板的 Herdr 会话、工作区和标签页。共享 app-server 中无法自动定位时，从 `herdr session list` 和指定会话的面板列表核对当前标签页。给 `spawn` 一并传入 `--herdr-session` 和 `--parent`，或将 `where` 返回的 `address` 作为 `--parent`。
   ```bash
-  herdr agent list | jq -r --arg id "$session_id" '.result.agents[] | select(.agent_session.value == $id) | .pane_id'
+  herdr --session "$herdr_session" pane list
+  hms where --herdr-session "$herdr_session" --parent "$pane"
   ```
-  查启动参数用 `hms argv "$role" --context "$context"`，可加 `--headless` 或 `--fresh`。查团队表及在线成员用 `hms ls --record "$record"`。
+  `--herdr-session` 是 Herdr 会话名，如 `main`。`--parent` 指向面板，如 `w1:p4`。`--session-id` 用于核对 Codex 等 agent 的原生会话 ID。旧地址缺少 socket 时，可用 `--herdr-session` 指定对应会话。
+- 查启动参数用 `hms argv "$role" --context "$context"`，可加 `--headless` 或 `--fresh`。查团队表及在线成员用 `hms ls --record "$record"`，可用 `--herdr-session "$herdr_session"` 指定会话。
