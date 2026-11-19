@@ -43,9 +43,23 @@ hms notify --to "$reply_address" --task "$task" --role "$role" --status complete
 hms close "$address"
 ```
 
+秘书按票的产物选启动配置。页面或前端交互原型用 `--route-from frontend`，从主项目的 `roles.frontend` 读取 CLI、模型和等级，即使本轮已 `--off frontend`。其他原型可借用与工作性质相符的项目角色配置。普通 grilling 直接用 Wayfinder 的配置。两张票可以沿用同一 context，各自选参数。
+
+```bash
+hms argv wayfinder --context "$context" --route-from frontend
+hms where
+# 核对坐标后派页面原型票
+hms spawn wayfinder --context "$context" --task "$prototype_ticket" --route-from frontend --prompt "$prototype_prompt"
+hms where
+# 核对坐标后派普通 grilling 票
+hms spawn wayfinder --context "$context" --task "$grilling_ticket" --prompt "$grilling_prompt"
+```
+
+正文附 wayfinder 技能、map 和对应票。页面原型会话以 Wayfinder 身份认领、讨论原型、请用户确认、关票、更新 map 并向秘书回报。
+
 - `spawn` 在发起面板所属的 Herdr 会话、工作区和标签页分屏。返回的 `address` 是绑定 socket 和面板的 `hms:…` 短 ID，用于续发或关闭。`delivered: false` 时先处理面板等待项，再用 `prompt` 补发返回的完整正文。再派工和回报照抄收到的 `--parent` 和 `--to` 短 ID。票级新实现者加 `--fresh --cwd "$worktree"`，沿用本轮 context。查主项目配置加 `--project "$project"`。
-- 团队显式成员在 Herdr 观察到首条任务活动并取得原生会话 ID 后登记，处理等待项后用原地址补发同样适用。首条任务确认超时时，先检查面板是否已收到任务或留下草稿。任务已开始但返回 `recorded: false` 时，核实 ID 后用 `record add` 补登。
-- 用任务正文附带的 `notify` 回报，状态可填 `completed`、`blocked`、`failed`。发起者等待审批时最多等一分钟，超时保留面板和结果供重发。
+- 团队显式成员在 Herdr 观察到首条任务活动并取得原生会话 ID 后登记，处理等待项后用原地址补发同样适用。首条任务确认超时时，先检查面板是否已收到任务或留下草稿。任务已开始且返回 `recorded: false` 时，核实 ID 后用 `record add --run "$run"` 补登。
+- 用任务正文附带的 `notify` 回报，状态可填 `completed`、`blocked`、`failed`。团队回报先入库，再投递给发起者。发起者等待审批时最多等一分钟，超时可使用原命令重发。
 - 等发送方结束回合后关闭。团队 PM 关自己的成员，秘书关 PM 和逐票 wayfinder。借用面板保留，明确移交管理时用 `hms close "$pane" --takeover`。
 
 ## 匿名派工
@@ -56,12 +70,19 @@ hms run "$role" --context "$context" --task "$task" --prompt "$prompt"
 hms record add --context "$context" --role "$role" --tool "$tool" --session-id "$id" --model "$model" --effort "$effort"
 ```
 
-同工具同型号且宿主可落实等级、目录和上下文时，用 `native` 返回的参数派原生子 agent，由宿主接收结果，成功后在团队中用 `record add` 登记实际会话 ID。其他情况用 `run`，输出直返，成功退出且返回原生 ID 时自动登记。两者都可加 `--cwd "$dir"`。
+同工具同型号且宿主可落实等级、目录和上下文时，用 `native` 返回的参数派原生子 agent，由宿主接收结果。团队登记时将返回的执行 ID 传给 `record add --run "$run"`。其他情况用 `run`，输出直返，成功退出且返回原生 ID 时自动登记。两者都可加 `--cwd "$dir"`。
+
+## 查记录与恢复
+
+团队台账在主项目的 `.agents/herdr/state/hms.sqlite3`。每轮仍生成 `.agents/herdr/session/<时间戳>-<标题>.md`，用户可直接查看秘书恢复命令和已登记成员。旧表可用 `hms ls --record "$record"` 原路径导入。有旧 context 时用 `hms ls --context "$context"` 一并登记配置。
+
+- 查本轮执行用 `hms ls --round "$round"`。加 `--run "$run"` 查看单次派工正文和结果。跨 worktree 按轮次 ID 查库时加 `--project "$project"`。
+- 重启后，在 Herdr 中运行索引里的命令恢复秘书，再从秘书会话执行 `hms recover --round "$round"`。已在线的会话沿用原面板，未完成的 Codex 和 Claude 会话按原生 ID 恢复。根据返回的任务状态、面板地址和回报地址续发工作，先看 `pendingReports`。旧表中只有会话信息的成员列在 `historical`，其他需人工判断的执行列在 `manual` 或标为 `needs_attention`。
 
 ## 同轮配置与排障
 
 - 用 `hms resolve --context "$context"` 加 `--set 角色.tool=CLI`、`--set 角色.model=型号`、`--set 角色.effort=等级` 或 `--on`、`--off` 预览变更。临时换 CLI 沿用项目为该 CLI 配置的唯一型号，否则问一次，可选 `default`。
 - 用 `hms record update --context "$context" --confirmed "$reply"` 加相同选项更新。已经确认的团队只补确认变化项，用户点名即确认。只登记答复用 `hms record confirm --context "$context" --confirmed "$reply"`。以后续返回的 context 为准。
-- 简单模式转团队用 `hms record update --context "$context" --mode complex` 并带上所需角色，沿用临时配置。展示配置并确认，原前端交接后再开 PM。团队每轮一张 `.agents/herdr/session/<时间戳>-<标题>.md`，登记会话 ID、工具、实际模型、思考等级及身份。实际模型和等级未知时填「未核实」。
+- 简单模式转团队用 `hms record update --context "$context" --mode complex` 并带上所需角色，沿用临时配置。展示配置并确认，原前端交接后再开 PM。
 - 手动启动的 Codex 使用共享 app-server 时，HMS 用当前线程 ID 匹配各 Herdr 会话的可见状态栏。定位失败时请用户在当前 Codex 的 `/statusline` 启用 `thread-id` 并移到最前，让完整 ID 显示在面板底部，然后运行 `hms where`。`--herdr-session` 是 Herdr 会话名，如 `main`。`--parent` 接受 `where` 返回的地址或面板 ID。`--session-id` 是 agent 的原生会话 ID。旧地址缺少 socket 时，可用 `--herdr-session` 指定对应会话。
-- 查启动参数用 `hms argv "$role" --context "$context"`，可加 `--headless` 或 `--fresh`。查团队表及在线成员用 `hms ls --record "$record"`，可用 `--herdr-session "$herdr_session"` 指定会话。
+- 查启动参数用 `hms argv "$role" --context "$context"`，可加 `--headless` 或 `--fresh`。

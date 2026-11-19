@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // herdr-mattpocock-skills 的机械操作脚本：解析职责配置、生成 CLI 参数、开关 Herdr 面板、
-// 匿名执行、直接回报、单表会话记录。这里没有任何工作流逻辑。
+// 匿名执行、回报、团队执行记录与恢复。这里没有任何工作流逻辑。
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -9,6 +9,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { commandProblems, configuredRoles, configuredTools, isSet, modeOptions, projectConfigPath, projectRoot, readRouting, toolId } from './routing.mjs';
 import { isShortReference, loadReference, saveReference } from './references.mjs';
+import * as store from './store.mjs';
 
 export const SKILL_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const SETUP_DIR = path.join(path.dirname(SKILL_DIR), 'herdr-setup');
@@ -24,6 +25,7 @@ const ROLE_USE = {
 };
 const CARRIER = { current: '当前会话', herdr: 'Herdr 面板', auto: '匿名，优先原生', background: '匿名 CLI', native: '宿主原生 subagent' };
 const STATUSES = new Set(['completed', 'blocked', 'failed']);
+const INDEX_TITLE = '# HMS 会话索引';
 const RECORD_COLUMNS = ['会话 ID', 'Agent 工具', '实际模型', '思考等级', '身份'];
 const LEGACY_RECORD_DIR = '.agents/herdr';
 const RECORD_DIR = `${LEGACY_RECORD_DIR}/session`;
@@ -349,6 +351,20 @@ function roleOf(snap, role, carrier, fresh = false) {
   return r;
 }
 
+function launchSnapshot(snap, role, { routeFrom, headless, fresh }) {
+  if (routeFrom === undefined) return snap;
+  if (role !== 'wayfinder' || headless || fresh) {
+    throw new Error('--route-from 用于 argv wayfinder 和 spawn wayfinder 的显式面板');
+  }
+  const { config } = loadConfig({}, snap.project);
+  const tools = configuredTools(config.tools);
+  const route = resolveBindings(configuredRoles(config), tools, snap.host)[routeFrom];
+  if (!route?.tool) throw new Error(`项目角色 ${routeFrom} 没有可借用的启动配置`);
+  const { tool, model, effort } = route;
+  const target = snap.roles[role];
+  return { ...snap, tools, roles: { ...snap.roles, [role]: target && { ...target, tool, model, effort } } };
+}
+
 function requireDevelopmentApproval(snap, role) {
   if (role === 'wayfinder' && snap.mode !== 'complex') throw new Error('HMS 内使用 wayfinder，先用 record update --context C --mode complex 转团队');
   if (snap.mode === 'complex' && !snap.confirmed && ['pm', 'frontend', 'backend', 'merger'].includes(role)) {
@@ -563,9 +579,9 @@ function waitAgent(socket, target, timeoutMs) {
 }
 
 // 面板地址随派工传递，避免焦点变化或继承的旧环境变量造成错投。
-function panelAddress(socket, agent, managed = false, task, pendingMember) {
+function panelAddress(socket, agent, managed = false, task, pendingMember, tracking) {
   const binding = { socket, pane: agent.pane_id, terminal: agent.terminal_id,
-    session: pendingMember ? undefined : agent.agent_session?.value, tool: agent.agent, managed, task, pendingMember };
+    session: pendingMember ? undefined : agent.agent_session?.value, tool: agent.agent, managed, task, pendingMember, ...tracking };
   return saveReference('hms', binding);
 }
 
@@ -836,7 +852,8 @@ const splitRow = line => line.trim().replace(/^\|/, '').replace(/(?<!\\)\|$/, ''
 const makeRow = cells => `| ${cells.map(cell).join(' | ')} |`;
 
 function readRecord(file) {
-  const lines = fs.readFileSync(file, 'utf8').trim().split(/\r?\n/);
+  let lines = fs.readFileSync(file, 'utf8').trim().split(/\r?\n/);
+  if (lines[0] === INDEX_TITLE) lines = lines.slice(lines.findIndex(l => l.startsWith('| 会话 ID |')));
   const header = splitRow(lines[0] ?? '');
   const separator = splitRow(lines[1] ?? '');
   const width = header.length;
@@ -845,8 +862,7 @@ function readRecord(file) {
       lines.slice(2).some(l => !l.trimStart().startsWith('|') || splitRow(l).length !== width)) {
     throw new Error('会话记录格式错误，应为 HMS 的会话表格');
   }
-  const rows = lines.slice(2).map(splitRow).filter(([id]) => validSessionId(id));
-  return { rows, width };
+  return lines.slice(2).map(l => splitRow(l).map(v => v.replaceAll('\\|', '|'))).filter(([id]) => validSessionId(id));
 }
 
 const validSessionId = id => typeof id === 'string' && id.trim() !== '' && id.trim() !== '未取得';
@@ -860,32 +876,109 @@ function recordPath(snap, file = snap.record) {
   if (!inRecordDir || !/^\d{8}-\d{6}-.+\.md$/.test(path.basename(abs))) {
     throw new Error(`会话表必须是 <项目>/${RECORD_DIR}/<时间戳>-<recap标题>.md，已有会话也可使用原路径`);
   }
-  readRecord(abs);
   return abs;
 }
 
-function standaloneRecord(file) {
+function recordProject(file) {
   const dir = path.dirname(path.resolve(file));
-  const project = path.resolve(dir, path.basename(dir) === path.basename(RECORD_DIR) ? '../../..' : '../..');
-  return recordPath({ mode: 'complex', project }, file);
+  return path.resolve(dir, path.basename(dir) === path.basename(RECORD_DIR) ? '../../..' : '../..');
 }
 
-function appendRecord(file, role, tool, meta, { once = false } = {}) {
-  if (!validSessionId(meta.sessionId)) return false;
-  const { width, rows } = readRecord(file);
-  if (once && rows.some(([id]) => id === meta.sessionId)) return true;
-  const cells = sessionCells(role, tool, meta).slice(0, width);
-  // 每行用一次 O_APPEND 写入，多个匿名调用并行回报时不会覆盖彼此。
-  const fd = fs.openSync(file, 'a');
-  try { fs.writeSync(fd, `${makeRow(cells)}\n`); }
-  finally { fs.closeSync(fd); }
-  return true;
+function standaloneRecord(file) {
+  return recordPath({ mode: 'complex', project: recordProject(file) }, file);
 }
 
-function sessionCells(role, tool, meta) {
+function memberData(role, tool, meta) {
+  if (!validSessionId(meta.sessionId)) return;
   const identity = Object.hasOwn(ROLE_USE, role) ? `${role}（${ROLE_USE[role]}）` : role || '未核实';
-  return [meta.sessionId.trim(), meta.observedTool || tool, isSet(meta.model) ? meta.model : '未核实',
-    isSet(meta.effort) ? meta.effort : '未核实', identity];
+  return { sessionId: meta.sessionId.trim(), role, tool: meta.observedTool || tool || '未核实',
+    model: isSet(meta.model) ? meta.model : '未核实', effort: isSet(meta.effort) ? meta.effort : '未核实', identity };
+}
+
+const memberCells = m => [m.sessionId, m.tool, m.model, m.effort, m.identity];
+const nativeTool = tool => tool === 'claude' ? 'claude-code' : tool;
+
+function resumeArgv(tool, id, { model, effort } = {}) {
+  // A session ID supplied to a CLI must be a single positional value.
+  if (!validSessionId(id) || /^-|[\s\u0000]/.test(id)) return;
+  const flags = isSet(model) ? ['--model', model] : [];
+  if (tool === 'codex') {
+    if (isSet(effort)) flags.push('-c', `model_reasoning_effort=${JSON.stringify(effort)}`);
+    return ['codex', 'resume', ...flags, id];
+  }
+  if (nativeTool(tool) === 'claude-code') {
+    if (isSet(effort)) flags.push('--effort', effort);
+    return ['claude', '--resume', id, ...flags];
+  }
+}
+
+function syncIndex(project, id) {
+  const tableHeader = fs.readFileSync(path.join(SKILL_DIR, 'templates/session-log.md'), 'utf8').trimEnd();
+  const render = () => {
+    const round = store.getRound(project, id);
+    const members = store.roundMembers(project, id);
+    const secretary = round.secretary;
+    const resume = secretary && resumeArgv(secretary.tool, secretary.sessionId);
+    const header = [INDEX_TITLE, '', `轮次 \`${id}\``, ''];
+    if (resume) {
+      header.push('秘书恢复命令', '', '\`\`\`sh', `cd ${shellQuote(project)} && ${shellJoin(resume)}`, '\`\`\`', '',
+        `恢复后，把轮次 ID 发给秘书，让它用 \`hms recover --round ${id}\` 接回本轮 worker。`, '');
+    }
+    return { file: round.record, text: [...header, tableHeader,
+      ...members.map(m => makeRow(memberCells(m))), ''].join('\n') };
+  };
+  for (;;) {
+    const { file, text } = render();
+    if (fs.existsSync(file) && fs.readFileSync(file, 'utf8') === text) return;
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const draft = path.join(path.dirname(file), `.${crypto.randomUUID()}.tmp`);
+    try {
+      fs.writeFileSync(draft, text, { flag: 'wx', flush: true });
+      fs.renameSync(draft, file);
+    } finally {
+      fs.rmSync(draft, { force: true });
+    }
+    // A concurrent registration may have committed while the index was written.
+    if (render().text === text) return;
+  }
+}
+
+function teamRound(record, snap, mode = 'import', context) {
+  const project = snap?.project ?? recordProject(record);
+  const id = store.roundKey(project, record);
+  const previous = store.getRound(project, id);
+  if (mode === 'import' && previous && (previous.context || !snap)) return { ...previous, project };
+  const members = mode !== 'create' && !previous ? readRecord(record).map(([sessionId, tool, model, effort, identity]) => {
+    const role = /^([a-z][a-z0-9_-]*)(?:（|$)/.exec(identity ?? '')?.[1]
+      ?? (sessionId === snap?.host.sessionId ? 'secretary' : undefined);
+    return { ...memberData(role, tool, { sessionId, model, effort }), ...(identity && { identity }) };
+  }) : [];
+  const host = snap && memberData('secretary', snap.host.tool, snap.host);
+  if (host) members.unshift(host);
+  const secretary = (host ?? members.find(m => m.role === 'secretary'));
+  const { roles, ...wire } = snap ?? {};
+  store.putRound(project, { id, record, context, snapshot: snap && wire,
+    secretary: secretary && { tool: secretary.tool, sessionId: secretary.sessionId } }, members, mode);
+  return { ...store.getRound(project, id), project };
+}
+
+function loadTeam(snap, record, context) {
+  if (!record) return;
+  const known = store.getRound(snap.project, store.roundKey(snap.project, record));
+  if (known?.context) return { ...known, project: snap.project };
+  return teamRound(record, snap, 'import', context?.startsWith('ctx:') ? context : saveContext(snap));
+}
+
+function refreshIndex(team) {
+  try { syncIndex(team.project, team.id); }
+  catch (e) { process.stderr.write(`会话已入库，索引更新失败：${e.message}。可用 hms ls --round ${team.id} 重建。\n`); }
+}
+
+function saveMember(team, member, run, changes = {}) {
+  if (run) store.updateRun(team.project, run, changes, member);
+  else if (member) store.addMember(team.project, team.id, member);
+  if (member) refreshIndex(team);
+  return Boolean(member);
 }
 
 function reportedSessionId(agent) {
@@ -899,13 +992,13 @@ function agentMetadata(a, sessionId = reportedSessionId(a)) {
 }
 
 function panelSessionId(socket, agent) {
-  const id = reportedSessionId(agent);
-  if (validSessionId(id)) return id;
   if (agent.agent === 'codex') {
     const visible = herdr(['pane', 'read', agent.pane_id, '--source', 'visible', '--lines', '2'], { socket, allowFail: true })?.raw;
     const ids = new Set(codexStatusFields(visible).map(([first]) => first).filter(field => SESSION_UUID_RE.test(field)));
     if (ids.size === 1) return ids.values().next().value;
   }
+  const id = reportedSessionId(agent);
+  if (validSessionId(id)) return id;
   if (['claude', 'claude-code'].includes(agent.agent)) return claudePanelSession(socket, agent.pane_id);
 }
 
@@ -926,8 +1019,9 @@ function afterFirstPrompt(socket, initial, waitForId) {
   }
 }
 
-function memberRecorded(file, sessionId) {
-  return validSessionId(sessionId) && readRecord(file).rows.some(([id]) => id === sessionId);
+function memberRecorded(team, sessionId, tool) {
+  return validSessionId(sessionId) && store.roundMembers(team.project, team.id)
+    .some(m => m.sessionId === sessionId && nativeTool(m.tool) === nativeTool(tool));
 }
 
 function submitPanelPrompt(socket, agent, prompt, confirmStart) {
@@ -1006,8 +1100,10 @@ function cmdArgv(o) {
   const role = o._[1];
   need({ role }, 'role');
   const { snap } = snapshotFrom(o, projectRoot(o));
-  const r = roleOf(snap, role, o.headless ? 'background' : 'herdr', o.fresh);
-  const { argv, command, patch } = prepareArgv(snap, r, o.headless ? 'headless' : 'interactive', o.headless ? '<派工正文>' : undefined);
+  const launch = launchSnapshot(snap, role, o);
+  const mode = o.headless ? 'headless' : 'interactive';
+  const r = roleOf(launch, role, o.headless ? 'background' : 'herdr', o.fresh);
+  const { argv, command, patch } = prepareArgv(launch, r, mode, o.headless ? '<派工正文>' : undefined);
   out({ role, tool: r.tool, model: r.model, effort: r.effort, argv, shell: command, patch });
 }
 
@@ -1038,6 +1134,44 @@ function cmdWhere(o) {
     terminalId: live.terminal_id, sessionId: sessionId ?? live.agent_session?.value ?? null, address: panelAddress(socket, live) });
 }
 
+function panelData(socket, agent, sessionId) {
+  const session = reportedSessionId(agent) === sessionId ? sessionId : undefined;
+  return { socket, pane: agent.pane_id, terminal: agent.terminal_id, tool: agent.agent, sessionId, session, name: agent.name };
+}
+
+function lockPanelCommands(lock) {
+  if (process.env.HMS_SINGLETON_LOCK === lock || !onPath('flock')) return false;
+  const child = spawnSync('flock', ['--exclusive', lock, process.execPath, HMS, ...process.argv.slice(2)], {
+    stdio: 'inherit', env: { ...process.env, HMS_SINGLETON_LOCK: lock },
+  });
+  if (child.error) throw child.error;
+  process.exitCode = child.status ?? 1;
+  return true;
+}
+
+function launchPanel(socket, parent, { cwd, name, direction = 'right', startTimeout, command, tool, tracking, placed }) {
+  const split = ['pane', 'split', '--pane', parent.pane_id, '--direction', direction, '--cwd', cwd, '--no-focus'];
+  const created = herdr(split, { socket }).result?.pane;
+  const pane = created?.pane_id;
+  if (!pane) throw new Error('Herdr 没有返回新面板 ID');
+  let agent;
+  try {
+    if (created.workspace_id !== parent.workspace_id || created.tab_id !== parent.tab_id) {
+      throw new Error(`分屏返回的标签页 ${created.tab_id} 与发起标签页 ${parent.tab_id} 不一致（Herdr socket ${socket}）`);
+    }
+    placed?.(created);
+    const launch = tool === 'dsh' ? shellJoin(['env', 'HERDR_ENV=1', 'HERDR_BIN_PATH=herdr', 'HERDR_PANE_ID=' + pane]) + ' ' + command : command;
+    herdr(['pane', 'run', pane, launch], { socket });
+    agent = waitAgent(socket, pane, startTimeout);
+    if (!agent) throw new Error('Herdr 尚未确认 agent 已就绪');
+    checkPanelBinding(socket, { bound: true, pane, terminal: created.terminal_id }, agent);
+    herdr(['agent', 'rename', pane, name], { socket });
+    return agent;
+  } catch (err) {
+    throw new Error(`${err.message}。已创建面板 ${pane}，派工未送达；管理地址 ${panelAddress(socket, agent ?? created, true, undefined, undefined, tracking)}`);
+  }
+}
+
 function cmdSpawn(o) {
   requireHerdr();
   const role = o._[1];
@@ -1046,24 +1180,21 @@ function cmdSpawn(o) {
   const { snap } = snapshotFrom(o, projectRoot(o));
   requireDevelopmentApproval(snap, role);
   if (o.fresh) need(o, 'cwd');
-  const r = roleOf(snap, role, 'herdr', o.fresh);
+  const launch = launchSnapshot(snap, role, o);
+  const r = roleOf(launch, role, 'herdr', o.fresh);
   const startTimeout = Number(o.startTimeout ?? 60000);
   if (!Number.isFinite(startTimeout) || startTimeout < 0) throw new Error('--start-timeout 需要非负毫秒数');
   const record = recordPath(snap);
-  const { socket, live: parent } = senderPanel(o);
+  const { socket, live: parent, sessionId: senderId } = senderPanel(o);
   const singleton = !o.fresh && singletonRole(snap.mode, role);
   const name = singleton ? singletonName(snap.roundId, role, r) : (o.name ?? `hms-${crypto.randomUUID().slice(0, 8)}`);
   if (!NAME_RE.test(name)) throw new Error('面板名须匹配 [a-z][a-z0-9_-]{0,31}');
 
-  // 并发首次派工复用同一面板。简单模式锁已有项目目录，无需创建文件。
-  const lock = record ?? snap.project;
-  if (singleton && process.env.HMS_SINGLETON_LOCK !== lock && onPath('flock')) {
-    const child = spawnSync('flock', ['--exclusive', lock, process.execPath, HMS, ...process.argv.slice(2)], {
-      stdio: 'inherit', env: { ...process.env, HMS_SINGLETON_LOCK: lock },
-    });
-    if (child.error) throw child.error;
-    process.exitCode = child.status ?? 1;
-    return;
+  // 索引会原子替换，单例锁使用稳定的目录。
+  const lock = record ? path.dirname(record) : snap.project;
+  if (singleton) {
+    if (record) fs.mkdirSync(lock, { recursive: true });
+    if (lockPanelCommands(lock)) return;
   }
 
   const formerPanels = new Set(snap.previousPanels?.[role] ?? []);
@@ -1083,52 +1214,55 @@ function cmdSpawn(o) {
     throw new Error(`面板仍在 ${actualCwd || '未知目录'}。本票新实现者用 spawn --fresh --cwd；普通面板请先完成交接再重开`);
   }
   const cwd = reused ? actualCwd : path.resolve(o.cwd ?? process.cwd());
-  const parentAddress = panelAddress(socket, parent, false, o.task);
-  let pane = agent?.pane_id;
+  const team = loadTeam(snap, record, o.context);
+  const run = team && store.startRun(team.project, team.id, {
+    task: o.task, role, tool: r.tool, carrier: 'herdr', cwd: cwd ?? process.cwd(), prompt: o.prompt,
+    config: { model: r.model, effort: r.effort, name },
+    parent: panelData(socket, parent, senderId ?? panelSessionId(socket, parent)),
+  });
+  const tracking = run && { run: run.id, project: team.project };
+  const parentAddress = panelAddress(socket, parent, false, o.task, undefined, tracking);
   if (!reused) {
-    const { command } = prepareArgv(snap, r, 'interactive');
-    const split = ['pane', 'split', '--pane', parent.pane_id, '--direction', o.direction ?? 'right', '--cwd', cwd, '--no-focus'];
-    const created = herdr(split, { socket }).result?.pane;
-    pane = created?.pane_id;
-    if (!pane) throw new Error('Herdr 没有返回新面板 ID');
     try {
-      if (created.workspace_id !== parent.workspace_id || created.tab_id !== parent.tab_id) {
-        throw new Error(`分屏返回的标签页 ${created.tab_id} 与发起标签页 ${parent.tab_id} 不一致（Herdr socket ${socket}）`);
-      }
-      const launch = r.tool === 'dsh' ? shellJoin(['env', 'HERDR_ENV=1', 'HERDR_BIN_PATH=herdr', 'HERDR_PANE_ID=' + pane]) + ' ' + command : command;
-      herdr(['pane', 'run', pane, launch], { socket });
-      agent = waitAgent(socket, pane, startTimeout);
-      if (!agent) throw new Error('Herdr 尚未确认 agent 已就绪');
-      checkPanelBinding(socket, { bound: true, pane, terminal: created.terminal_id }, agent);
-      herdr(['agent', 'rename', pane, name], { socket });
+      const { command } = prepareArgv(launch, r, 'interactive');
+      agent = launchPanel(socket, parent, { cwd, name, direction: o.direction, startTimeout, command, tool: r.tool, tracking,
+        placed: run && (created => store.updateRun(team.project, run, { panel: panelData(socket, created) })) });
     } catch (err) {
-      throw new Error(`${err.message}。已创建面板 ${pane}，派工未送达；管理地址 ${panelAddress(socket, agent ?? created, true)}`);
+      if (run) store.updateRun(team.project, run, { startup: 'failed', error: err.message });
+      throw err;
     }
   }
 
-  const report = { role, task: o.task, name, pane, workspace: parent.workspace_id, tab: parent.tab_id, herdrSocket: socket,
-    cwd, tool: r.tool, model: r.model, effort: r.effort, record, reused };
-  let sessionId = reused && record ? panelSessionId(socket, agent) : reportedSessionId(agent);
-  let recorded = record ? memberRecorded(record, reused ? sessionId : undefined) : undefined;
-  const pending = record && !recorded ? { file: record, role, tool: r.tool } : undefined;
-  const managementAddress = () => panelAddress(socket, agent, true, undefined, recorded ? undefined : pending);
+  const pane = agent.pane_id;
+  const report = { role, task: o.task, run: run?.id, name, pane, workspace: parent.workspace_id, tab: parent.tab_id,
+    herdrSocket: socket, cwd, tool: r.tool, model: r.model, effort: r.effort, record, reused };
+  let sessionId = reused && team ? panelSessionId(socket, agent) : reportedSessionId(agent);
+  let recorded = team ? memberRecorded(team, reused ? sessionId : undefined, agent.agent) : undefined;
+  const confirmStart = Boolean(team && !recorded);
+  const pending = team && { file: record, role, tool: r.tool };
+  const managementAddress = () => panelAddress(socket, agent, true, undefined,
+    recorded && report.delivered ? undefined : pending, tracking);
+  if (run) store.updateRun(team.project, run, { panel: panelData(socket, agent, recorded ? sessionId : undefined) });
   try {
-    const address = panelAddress(socket, reused ? agent : { ...agent, agent_session: undefined }, true);
+    const address = panelAddress(socket, reused ? agent : { ...agent, agent_session: undefined }, true, undefined, undefined, tracking);
     const prompt = dispatchPrompt(snap, { context: o.context, role, task: o.task, parent: parentAddress, self: address, cwd, body: o.prompt });
-    report.delivered = submitPanelPrompt(socket, agent, prompt, Boolean(pending));
-    if (!report.delivered) {
-      report.prompt = prompt;
-      report.note = '面板等待交互，处理后用 prompt 将完整正文补发到 address';
-      if (!reused && r.tool === 'gemini') sessionId = null;
-    } else if (pending || !reused) {
-      ({ agent, sessionId } = afterFirstPrompt(socket, agent, Boolean(pending)));
-      if (pending) {
-        recorded = appendRecord(record, role, r.tool, agentMetadata(agent, sessionId), { once: true });
-        if (!recorded) report.note = '首条任务已开始，待核实原生会话 ID 后用 record add 补登';
-      }
-    }
+    report.delivered = submitPanelPrompt(socket, agent, prompt, confirmStart);
+    if (report.delivered && (confirmStart || !reused)) ({ agent, sessionId } = afterFirstPrompt(socket, agent, confirmStart));
+    if (!report.delivered) report.prompt = prompt;
   } catch (err) {
+    if (run) store.updateRun(team.project, run, { startup: 'unconfirmed', error: err.message });
     throw new Error(`${err.message}。面板 ${pane} 的管理地址 ${managementAddress()}`);
+  }
+  if (!report.delivered) {
+    if (run) store.updateRun(team.project, run, { startup: 'blocked' });
+    report.note = '面板等待交互，处理后用 prompt 将完整正文补发到 address';
+    if (!reused && r.tool === 'gemini') sessionId = null;
+  } else if (run) {
+    const member = memberData(role, r.tool, agentMetadata(agent, sessionId));
+    recorded = saveMember(team, member, run, {
+      startup: 'started', sessionId: member?.sessionId, actualTool: member?.tool, panel: panelData(socket, agent, member?.sessionId),
+    });
+    if (!recorded) report.note = '首条任务已开始，待核实原生会话 ID 后用 record add --run 补登';
   }
   out({ ...report, address: managementAddress(), sessionId: sessionId ?? null, recorded });
 }
@@ -1140,19 +1274,26 @@ function cmdPrompt(o) {
   const ref = panelRef(target);
   const socket = targetSocket(o, ref);
   const live = panelTarget(socket, ref);
-  let pending = ref.pendingMember;
+  const pending = ref.pendingMember;
+  let team, run, already;
   if (pending) {
     if (!ref.managed || !ref.socket || !ref.terminal) throw new Error('补发需要派工返回的面板地址');
     need(pending, 'file', 'role', 'tool');
-    const file = standaloneRecord(pending.file);
-    pending = memberRecorded(file, panelSessionId(socket, live)) ? undefined : { ...pending, file };
+    team = teamRound(standaloneRecord(pending.file));
+    run = ref.run && store.getRun(team.project, ref.run);
+    if (run && run.round !== team.id) throw new Error('补发地址与执行记录不符');
+    already = memberRecorded(team, panelSessionId(socket, live), live.agent);
   }
-  if (!submitPanelPrompt(socket, live, o.prompt, Boolean(pending))) throw new Error(`${live.pane_id} 正在等待交互`);
+  const confirmStart = Boolean(pending && !already);
+  if (!submitPanelPrompt(socket, live, o.prompt, confirmStart)) throw new Error(`${live.pane_id} 正在等待交互`);
   const result = { target: live.pane_id, delivered: true };
-  if (pending) {
-    const { agent, sessionId } = afterFirstPrompt(socket, live, true);
+  if (confirmStart || (run && run.startup !== 'started')) {
+    const { agent, sessionId } = afterFirstPrompt(socket, live, confirmStart);
+    const member = memberData(pending.role, pending.tool, agentMetadata(agent, sessionId));
     result.sessionId = sessionId;
-    result.recorded = appendRecord(pending.file, pending.role, pending.tool, agentMetadata(agent, sessionId), { once: true });
+    if (run) result.run = run.id;
+    result.recorded = saveMember(team, member, run, { startup: 'started', sessionId: member?.sessionId,
+      actualTool: member?.tool, panel: panelData(socket, agent, member?.sessionId), error: null });
   }
   out(result);
 }
@@ -1168,7 +1309,10 @@ function cmdNative(o) {
   if (r.tool !== caller.tool || !isSet(r.model) || r.model !== callerModel) throw new Error('仅同工具同型号可走原生；宿主型号可用 --caller-model 提供，其他情况用 run');
   const record = recordPath(snap);
   const cwd = path.resolve(o.cwd ?? process.cwd());
-  out({ role, tool: r.tool, model: r.model, effort: r.effort, cwd, record,
+  const team = loadTeam(snap, record, o.context);
+  const run = team && store.startRun(team.project, team.id, { task: o.task, role, tool: r.tool, carrier: 'native', cwd,
+    prompt: o.prompt, config: { model: r.model, effort: r.effort } });
+  out({ role, tool: r.tool, model: r.model, effort: r.effort, cwd, record, run: run?.id,
     prompt: dispatchPrompt(snap, { context: o.context, role, task: o.task, cwd, body: o.prompt }) });
 }
 
@@ -1189,6 +1333,9 @@ function cmdRun(o) {
     argv = ['flock', '--exclusive', '--wait', String(Number(o.lockTimeout ?? 1800000) / 1000), dir, ...argv];
   }
   const cwd = path.resolve(o.cwd ?? process.cwd());
+  const team = loadTeam(snap, record, o.context);
+  const run = team && store.startRun(team.project, team.id, { task: o.task, role, tool: r.tool,
+    carrier: 'background', cwd, prompt: o.prompt, config: { model: r.model, effort: r.effort } });
   const res = spawnSync(argv[0], argv.slice(1), {
     cwd, encoding: 'utf8',
     input: snap.tools[r.tool].promptInput === 'stdin' ? prompt : undefined,
@@ -1198,11 +1345,17 @@ function cmdRun(o) {
   const exit = res.error ? null : res.status;
   const succeeded = exit === 0 && !meta.failed;
   let recorded;
-  if (record) {
+  if (run) {
     if (succeeded && r.tool === 'dsh') Object.assign(meta, dstHeader(meta.sessionId, cwd));
-    recorded = succeeded && appendRecord(record, role, r.tool, meta);
+    const member = succeeded ? memberData(role, r.tool, meta) : undefined;
+    recorded = saveMember(team, member, run, {
+      startup: succeeded ? 'started' : 'failed', status: succeeded ? 'completed' : 'failed',
+      sessionId: validSessionId(meta.sessionId) ? meta.sessionId : null, actualTool: member?.tool,
+      result: succeeded ? res.stdout : null,
+      error: succeeded ? null : res.error?.message || oneLine(res.stderr).slice(0, 1000) || `CLI 执行失败（退出码 ${exit}）`,
+    });
   }
-  out({ role, task: o.task, tool: r.tool, model: r.model, effort: r.effort, sessionId: meta.sessionId ?? null,
+  out({ role, task: o.task, run: run?.id, tool: r.tool, model: r.model, effort: r.effort, sessionId: meta.sessionId ?? null,
     exit, signal: res.signal ?? null, error: res.error?.message ?? null, stdout: res.stdout ?? '', stderr: res.stderr ?? '', record, recorded });
   process.exitCode = exit ?? 1;
 }
@@ -1210,21 +1363,32 @@ function cmdRun(o) {
 function cmdNotify(o) {
   need(o, 'to', 'task', 'role', 'status', 'summary');
   if (!STATUSES.has(o.status)) throw new Error('--status 取 completed、blocked、failed');
-  requireHerdr();
   const ref = panelRef(o.to);
   if (!ref.task) throw new Error('回报未送达。请使用派工正文中绑定任务的 --to 地址；旧任务可核对发起者后用 prompt 补发');
   if (ref.task !== o.task) throw new Error(`回报任务 ${o.task} 与派工 ${ref.task} 不符，未送达`);
-  const socket = targetSocket(o, ref);
-  const text = `HERDR_RESULT task=${o.task} status=${o.status} role=${o.role}${o.result ? ' result=' + o.result : ''} summary=${o.summary}`;
   const waitMs = Number(o.waitMs ?? 60000);
   if (!Number.isFinite(waitMs) || waitMs < 0) throw new Error('--wait-ms 需要非负毫秒数');
+  const run = ref.run && store.getRun(ref.project, ref.run);
+  if (ref.run && (!run || run.task !== o.task || run.role !== o.role)) throw new Error('回报与派工登记的任务或身份不符');
+  const target = run?.parent ? { ...ref, ...run.parent, session: run.parent.session } : ref;
+  const selected = o.herdrSession && selectedSocket(o, target);
+  const report = run && store.recordReport(ref.project, run.id, o);
+  if (report?.deliveredAt) return out({ delivered: true, report: report.id, task: o.task, reused: true });
+  requireHerdr();
+  const socket = selected || targetSocket(o, target);
+  const text = `HERDR_RESULT task=${o.task} status=${o.status} role=${o.role}${o.result ? ' result=' + o.result : ''} summary=${o.summary}`;
   const deadline = Date.now() + Math.min(waitMs, 60000);
   for (;;) {
-    const live = panelTarget(socket, ref);
+    const live = panelTarget(socket, target);
+    if (run?.parent?.sessionId) {
+      const id = panelSessionId(socket, live);
+      if (id && id !== run.parent.sessionId) throw new Error('发起者的原生会话已变更，回报留在 SQLite');
+    }
     if (live.agent_status !== 'blocked') {
       try {
         herdr(['agent', 'prompt', live.pane_id, text], { socket, timeout: waitMs ? Math.max(1, deadline - Date.now()) : 5000 });
-        out({ delivered: true, to: live.pane_id, task: o.task });
+        if (report) store.markDelivered(ref.project, report.id);
+        out({ delivered: true, to: live.pane_id, task: o.task, report: report?.id });
         return;
       } catch (err) {
         if (err.code === 'ETIMEDOUT') throw new Error('Herdr 提交回执超时，先核对发起者是否已收到本任务结果');
@@ -1253,14 +1417,165 @@ function cmdClose(o) {
   }
   if (['working', 'blocked'].includes(live.agent_status) && !o.force) throw new Error(`agent 状态为 ${live.agent_status}，保留面板；处理完本回合后再关闭`);
   herdr(['pane', 'close', live.pane_id], { socket });
+  if (ref.project) store.closePanel(ref.project, panelData(socket, live));
   out({ closed: live.pane_id });
 }
 
-function cmdLs(o) {
-  requireHerdr();
+function selectRound(o) {
+  if (o.round) {
+    const project = projectRoot(o);
+    const round = store.getRound(project, o.round);
+    if (!round) throw new Error(`项目 ${project} 中没有轮次 ${o.round}`);
+    return { ...round, project };
+  }
+  if (o.context) {
+    const { snap } = snapshotFrom(o, projectRoot(o));
+    return loadTeam(snap, recordPath(snap, o.record), o.context);
+  }
   need(o, 'record');
-  const socket = selectedSocket(o) ?? inheritedSocket();
-  out({ sessions: readRecord(path.resolve(o.record)).rows, live: herdr(['agent', 'list'], { socket }) });
+  return teamRound(standaloneRecord(o.record));
+}
+
+function liveRun(run) {
+  const panel = run.panel;
+  if (!panel?.terminal || panel.closed || !onPath('herdr')) return;
+  const agent = agentInfo(panel.socket, panel.pane);
+  if (agent?.terminal_id !== panel.terminal || (panel.tool && panel.tool !== agent.agent)) return;
+  if (run.sessionId && panelSessionId(panel.socket, agent) !== run.sessionId) return;
+  return agent;
+}
+
+function cmdLs(o) {
+  const team = selectRound(o);
+  if (!team) return out({ sessions: [], runs: [], live: [] });
+  syncIndex(team.project, team.id);
+  if (o.run) {
+    const run = store.getRun(team.project, o.run);
+    if (!run || run.round !== team.id) throw new Error(`轮次 ${team.id} 中没有 ${o.run}`);
+    return out({ ...run, live: liveRun(run)?.agent_status ?? null });
+  }
+  const runs = store.roundRuns(team.project, team.id).map(({ prompt, config, seq, result, ...run }) => {
+    const live = liveRun(run);
+    return { ...run, live: live?.agent_status ?? null };
+  });
+  const socket = onPath('herdr') && (selectedSocket(o) ?? inheritedSocket());
+  const live = socket ? agentList(socket) : [];
+  out({ round: team.id, record: team.record, context: team.context,
+    sessions: store.roundMembers(team.project, team.id).map(memberCells), runs, live });
+}
+
+const sessionKey = (tool, id) => validSessionId(id) ? JSON.stringify([nativeTool(tool), id]) : null;
+
+function recoveryPanels(socket, needed) {
+  const panels = new Map();
+  const { sessions } = herdr(['session', 'list', '--json'], { timeout: 5000 });
+  if (!Array.isArray(sessions)) throw new Error('Herdr 未返回会话列表，无法核对已在线的 worker');
+  const sockets = new Set([socket]);
+  for (const session of sessions.filter(s => s.running)) {
+    if (!path.isAbsolute(session.socket_path ?? '')) throw new Error(`Herdr 会话 ${session.name} 缺少 socket 地址`);
+    sockets.add(session.socket_path);
+  }
+  const tools = new Set([...needed].map(key => JSON.parse(key)[0]));
+  for (const candidate of sockets) {
+    const agents = herdr(['agent', 'list'], { socket: candidate, timeout: 5000 }).result?.agents;
+    if (!Array.isArray(agents)) throw new Error(`Herdr 未返回 ${candidate} 的 agent 列表`);
+    for (const agent of agents) {
+      if (!agent.terminal_id || !tools.has(nativeTool(agent.agent))) continue;
+      const sessionId = panelSessionId(candidate, agent);
+      const key = sessionKey(agent.agent, sessionId);
+      if (!needed.has(key)) continue;
+      const matches = panels.get(key) ?? [];
+      matches.push({ socket: candidate, agent, sessionId });
+      panels.set(key, matches);
+    }
+  }
+  return panels;
+}
+
+function recoverWorker(team, runs, matches, caller, startTimeout) {
+  const latest = runs.at(-1);
+  const tasks = runs.map(({ id, task, role, status }) => ({ run: id, task, role, status }));
+  let current = matches[0];
+  try {
+    if (matches.length > 1) throw new Error('同一原生会话匹配多个在线面板');
+    if (!current) {
+      const argv = resumeArgv(latest.actualTool ?? latest.tool, latest.sessionId, latest.config);
+      if (!argv) throw new Error('该工具没有已配置的原生恢复命令');
+      if (!onPath(argv[0])) throw new Error(`找不到 ${argv[0]} 命令`);
+      if (!fs.statSync(latest.cwd, { throwIfNoEntry: false })?.isDirectory()) throw new Error(`工作目录已不存在 ${latest.cwd}`);
+      const name = latest.config?.name ?? `hms-${latest.id.slice(4).toLowerCase().replaceAll('_', '-').slice(0, 8)}`;
+      if (agentInfo(caller.socket, name)) throw new Error(`面板名 ${name} 已占用，请核对原生会话 ID`);
+      const initial = launchPanel(caller.socket, caller.live, { cwd: latest.cwd, name, startTimeout,
+        command: shellJoin(argv), tool: latest.tool, tracking: { project: team.project, run: latest.id } });
+      const { agent, sessionId } = afterFirstPrompt(caller.socket, initial, true);
+      if (sessionId !== latest.sessionId || nativeTool(agent.agent) !== nativeTool(latest.actualTool ?? latest.tool)) {
+        const address = panelAddress(caller.socket, agent, true);
+        throw new Error(`恢复后的原生会话未核实，检查面板 ${address}`);
+      }
+      current = { socket: caller.socket, agent, sessionId };
+    }
+    for (const run of runs) store.updateRun(team.project, run, { panel: panelData(current.socket, current.agent, current.sessionId) });
+    return { current, worker: { sessionId: latest.sessionId, tool: latest.actualTool ?? latest.tool, tasks,
+      address: panelAddress(current.socket, current.agent, true, undefined, undefined, { project: team.project, run: latest.id }),
+      state: matches.length ? 'live' : 'resumed' } };
+  } catch (e) {
+    return { worker: { sessionId: latest.sessionId, tasks, state: 'needs_attention', error: e.message } };
+  }
+}
+
+function cmdRecover(o) {
+  const team = selectRound(o);
+  if (!team?.secretary) throw new Error('本轮缺少已核实的秘书会话 ID');
+  requireHerdr();
+  const caller = senderPanel(o);
+  const secretaryId = caller.sessionId ?? panelSessionId(caller.socket, caller.live);
+  const secretaryKey = sessionKey(team.secretary.tool, team.secretary.sessionId);
+  if (sessionKey(caller.live.agent, secretaryId) !== secretaryKey) throw new Error('请从会话索引恢复本轮秘书，再执行 recover');
+  const startTimeout = Number(o.startTimeout ?? 60000);
+  if (!Number.isFinite(startTimeout) || startTimeout < 0) throw new Error('--start-timeout 需要非负毫秒数');
+  syncIndex(team.project, team.id);
+  if (lockPanelCommands(path.dirname(team.record))) return;
+  const context = team.snapshot ? saveContext(team.snapshot) : team.context;
+  const runs = store.roundRuns(team.project, team.id);
+  const groups = new Map();
+  const manual = [];
+  const needed = new Set([secretaryKey]);
+  for (const run of runs) {
+    const parent = sessionKey(run.parent?.tool, run.parent?.sessionId);
+    if (parent) needed.add(parent);
+    if (['completed', 'failed'].includes(run.status)) continue;
+    const key = sessionKey(run.actualTool ?? run.tool, run.sessionId);
+    if (!key || run.carrier !== 'herdr' || run.startup !== 'started' || run.panel?.closed) {
+      manual.push({ run: run.id, task: run.task, role: run.role, carrier: run.carrier, startup: run.startup, closed: run.panel?.closed });
+      continue;
+    }
+    needed.add(key);
+    const group = groups.get(key) ?? [];
+    group.push(run);
+    groups.set(key, group);
+  }
+  const panels = recoveryPanels(caller.socket, needed);
+  const workers = [];
+  for (const [key, group] of groups) {
+    const { current, worker } = recoverWorker(team, group, panels.get(key) ?? [], caller, startTimeout);
+    if (current) panels.set(key, [current]);
+    workers.push(worker);
+  }
+  panels.set(secretaryKey, [{ socket: caller.socket, agent: caller.live, sessionId: secretaryId }]);
+  for (const run of runs) {
+    const key = sessionKey(run.parent?.tool, run.parent?.sessionId);
+    const matches = panels.get(key) ?? [];
+    if (matches.length !== 1) continue;
+    const { socket, agent, sessionId } = matches[0];
+    store.updateRun(team.project, run, { parent: panelData(socket, agent, sessionId) });
+    const task = workers.flatMap(w => w.tasks).find(t => t.run === run.id);
+    if (task) task.replyAddress = panelAddress(socket, agent, false, run.task, undefined, { project: team.project, run: run.id });
+  }
+  const known = new Set(runs.map(r => sessionKey(r.actualTool ?? r.tool, r.sessionId)));
+  const historical = store.roundMembers(team.project, team.id)
+    .filter(m => m.role !== 'secretary' && !known.has(sessionKey(m.tool, m.sessionId)))
+    .map(m => ({ sessionId: m.sessionId, tool: m.tool, identity: m.identity, resume: resumeArgv(m.tool, m.sessionId) }));
+  out({ round: team.id, context, workers, manual, historical, pendingReports: store.pendingReports(team.project, team.id) });
 }
 
 function developmentProblems(snap) {
@@ -1280,9 +1595,14 @@ function confirmSnap(snap, note) {
   return { ...snap, confirmed: true, confirmedAt: nowIso(), confirmation: oneLine(note) };
 }
 
-function roundReference(snap, title, record) {
+function roundReference(snap, title, record, mode = 'update') {
   const roundId = snap.roundId ?? record ?? crypto.randomUUID();
-  return { record, context: saveContext({ ...snap, roundId, title, record }) };
+  const snapshot = { ...snap, roundId, title, record };
+  const context = saveContext(snapshot);
+  if (!record) return { record, context };
+  const team = teamRound(record, snapshot, mode, context);
+  refreshIndex(team);
+  return { record, context, round: team.id };
 }
 
 function createTeamRecord(snap, title, promote) {
@@ -1290,31 +1610,22 @@ function createTeamRecord(snap, title, promote) {
   // 同一个简单 context 重试升级时，仍指向它自己的团队表。
   const suffix = promote ? '-' + crypto.createHash('sha256').update(snap.roundId).digest('hex').slice(0, 12) : '';
   const base = `${stamp(new Date(snap.createdAt))}-${title}${suffix}`;
-  if (promote && !fs.existsSync(path.join(dir, `${base}.md`))) {
+  const known = record => fs.existsSync(record) || store.getRound(snap.project, store.roundKey(snap.project, record));
+  if (promote && !known(path.join(dir, `${base}.md`))) {
     const legacy = path.join(snap.project, LEGACY_RECORD_DIR, `${base}.md`);
-    if (fs.existsSync(legacy)) return roundReference(snap, title, recordPath(snap, legacy));
+    if (known(legacy)) return roundReference(snap, title, recordPath(snap, legacy));
   }
-  fs.mkdirSync(dir, { recursive: true });
-  const template = fs.readFileSync(path.join(SKILL_DIR, 'templates/session-log.md'), 'utf8');
-  const host = validSessionId(snap.host.sessionId) ? makeRow(sessionCells('secretary', snap.host.tool || '未核实', snap.host)) + '\n' : '';
-  const draft = path.join(dir, `.${crypto.randomUUID()}.tmp`);
-  try {
-    fs.writeFileSync(draft, `${template.trimEnd()}\n${host}`, { flag: 'wx' });
-    for (let n = 1; ; n++) {
-      const record = path.join(dir, `${base}${n === 1 ? '' : `-${n}`}.md`);
-      if (fs.existsSync(record)) {
-        if (promote) return roundReference(snap, title, recordPath(snap, record));
-        continue;
-      }
-      const reference = roundReference(snap, title, record);
-      try { fs.linkSync(draft, record); return reference; }
-      catch (e) {
-        if (e.code !== 'EEXIST') throw e;
-        if (promote) return roundReference(snap, title, recordPath(snap, record));
-      }
+  for (let n = 1; ; n++) {
+    const record = path.join(dir, `${base}${n === 1 ? '' : `-${n}`}.md`);
+    if (known(record)) {
+      if (promote) return roundReference(snap, title, record);
+      continue;
     }
-  } finally {
-    fs.rmSync(draft, { force: true });
+    try { return roundReference(snap, title, record, 'create'); }
+    catch (e) {
+      if (!e.message.includes('UNIQUE constraint failed: rounds.')) throw e;
+      if (promote) return roundReference(snap, title, record);
+    }
   }
 }
 
@@ -1333,17 +1644,23 @@ function initRound(o) {
 function recordAdd(o) {
   need(o, 'tool');
   // 表路径本身无法区分历史简单模式和团队。脱离 context 补登须明示团队模式。
-  let record;
+  let record, team;
   if (o.context) {
     const { snap } = snapshotFrom(o, projectRoot(o));
     record = recordPath(snap, o.record);
+    team = loadTeam(snap, record, o.context);
   } else if (o.mode === 'complex') {
     need(o, 'record');
     record = standaloneRecord(o.record);
+    team = teamRound(record);
   }
-  if (!record) return out({ record: null, added: false });
-  const added = appendRecord(record, o.role, o.tool, { sessionId: o.sessionId, model: o.model, effort: o.effort });
-  out({ record, added });
+  if (!team) return out({ record: null, added: false });
+  const run = o.run && store.getRun(team.project, o.run);
+  if (o.run && (!run || run.round !== team.id || (o.role && run.role !== o.role))) throw new Error('补登与执行记录的轮次或身份不符');
+  const member = memberData(run?.role ?? o.role, o.tool, { sessionId: o.sessionId, model: o.model, effort: o.effort });
+  const added = member && saveMember(team, member, run, { startup: 'started', sessionId: member.sessionId, actualTool: member.tool,
+    error: null, ...(run?.carrier === 'native' && { status: 'completed' }) });
+  out({ record, added: Boolean(added) });
 }
 
 function cmdRecord(o) {
@@ -1360,28 +1677,30 @@ const HELP = `hms — Herdr 角色调度
   resolve [--mode simple|complex] [--host T --host-model M --host-effort E] [--set role.field=value] [--on a,b] [--off a,b]
   resolve --context C --set role.model=M                 仅展示受影响的身份
   init [--title 简称] [同 resolve 的配置] [--session-id ID] [--confirmed 用户答复]
-                                                        返回本轮短 ID，团队模式在 ${RECORD_DIR}/ 建成员表
+                                                        返回本轮短 ID，团队模式建库及会话索引
   record confirm --context C --confirmed 用户答复         确认本轮配置，返回新 context
   record update --context C [--mode complex] [--set ...] [--on a,b] [--off a,b] [--confirmed 用户答复]
-  record add --context C --role ROLE --tool T --session-id ID [--model M --effort E]
+  record add --context C --role ROLE --tool T --session-id ID [--run RUN --model M --effort E]
   where [--herdr-session NAME] [--parent PANE或地址] [--session-id ID]
-  spawn ROLE --context C --task ID --prompt 正文 [--herdr-session NAME] [--parent PANE或地址] [--session-id ID] [--fresh --cwd DIR]
+  spawn ROLE --context C --task ID --prompt 正文 [--herdr-session NAME] [--parent PANE或地址] [--session-id ID] [--fresh --cwd DIR] [--route-from ROLE]
   prompt PANE或地址 --prompt 正文 [--herdr-session NAME]
   native ROLE --context C --caller 宿主工具 [--caller-model M] --task ID --prompt 正文 [--cwd DIR]
   run ROLE --context C --task ID --prompt 正文 [--cwd DIR] [--lock 目录]
   notify --to 地址 --task ID --role ROLE --status completed|blocked|failed --summary 正文 [--wait-ms 0..60000] [--herdr-session NAME]
   close 地址 [--force]                                   移交管理的既有面板用 close PANE --takeover [--herdr-session NAME]
-  ls --record 表路径 [--herdr-session NAME]
-  argv ROLE [--context C] [--headless] [--fresh]          预览实际工具命令
+  ls --round R | --context C | --record 索引路径 [--run RUN] [--herdr-session NAME]
+  recover --round R [--project DIR]                     在恢复后的秘书会话中接回未完成的 worker
+  argv ROLE [--context C] [--headless] [--fresh] [--route-from ROLE]  预览实际工具命令
 
 --context 使用本轮 ctx:… 短 ID，--parent / --to 和面板管理使用 hms:… 短 ID。
 where 核对当前发起面板，spawn 重新核对并在同一标签页分屏。--herdr-session 指定 Herdr 会话名，--session-id 指 agent 原生会话 ID。
+--route-from ROLE 为当前 Wayfinder 票读取项目 roles.ROLE 的工具、模型和等级。
 --fresh 用项目的 frontend 或 backend 配置，在本票 worktree 开显式新面板。--project DIR 指定主项目。`;
 
 export function main(argv) {
   const o = parseArgs(argv);
   const cmd = o._[0];
-  const table = { init: initRound, resolve: cmdResolve, argv: cmdArgv, where: cmdWhere, spawn: cmdSpawn, prompt: cmdPrompt, native: cmdNative, run: cmdRun, notify: cmdNotify, close: cmdClose, ls: cmdLs, record: cmdRecord };
+  const table = { init: initRound, resolve: cmdResolve, argv: cmdArgv, where: cmdWhere, spawn: cmdSpawn, prompt: cmdPrompt, native: cmdNative, run: cmdRun, notify: cmdNotify, close: cmdClose, ls: cmdLs, record: cmdRecord, recover: cmdRecover };
   if (!cmd || o.help || cmd === 'help') return out(HELP);
   if (cmd === 'config') {
     const project = o.context ? snapshotFrom(o, projectRoot(o)).snap.project : projectRoot(o);
@@ -1392,6 +1711,7 @@ export function main(argv) {
     if (o[key] !== undefined) throw new Error(`不再支持 --${key} 文件通信；使用 --context / --prompt 直接传递正文，输出直接返回调用方`);
   }
   if (o.session !== undefined) throw new Error('用 --herdr-session 指定 Herdr 会话名称，用 --session-id 指定 agent 原生会话 ID');
+  if (o.routeFrom !== undefined && !['argv', 'spawn'].includes(cmd)) throw new Error('--route-from 用于 argv wayfinder 和 spawn wayfinder');
   if (!table[cmd]) throw new Error(`未知命令 ${cmd}；运行 hms help 查看用法`);
   return table[cmd](o);
 }

@@ -19,6 +19,8 @@ npx herdr-mattpocock-skills install --agent codex --global
 
 Codex 和通用 `agents` 共用 `.agents/skills`，共享路径只安装一次。引用 `$herdr-mattpocock-skills` 默认简单模式，本轮要求团队、多 agent 或使用 wayfinder 时转团队。口头覆盖仅本轮生效。
 
+团队记录使用项目本地 SQLite。运行环境需要 Node.js 20 或更新版本。Node 未提供 `node:sqlite` 时，使用 PATH 上的 `sqlite3`（3.38 或更新版本）。
+
 [HMS 操作手册](skills/herdr-mattpocock-skills/SKILL.md) · [项目路由配置](skills/herdr-setup/SKILL.md)
 
 ## Codex 安装
@@ -27,6 +29,7 @@ Codex 和通用 `agents` 共用 `.agents/skills`，共享路径只安装一次�
 
 - 项目安装使用项目的 `.codex/`。
 - 全局安装使用 `~/.codex/`，Windows 使用 `%USERPROFILE%\.codex\`。设置 `CODEX_HOME` 时以该目录为准。
+- 项目未设置 `tui.status_line` 或数组只有 `thread-id` 时，安装器复制用户的状态栏设置，将 `thread-id` 放在首项。若 `CODEX_HOME` 指向当前项目的 `.codex/`，则从用户默认目录读取。项目已有其他状态栏项时保留项目自己的列表。
 
 重新打开官方 `codex`，按 `/hooks` 的提示启用 HMS hook。Hook 在首个回合把 Herdr 坐标交给模型。共享 app-server 下，`hms where` 和 `hms spawn` 使用状态栏完整线程 ID 实时核对面板。 [Codex hook 文档](https://developers.openai.com/codex/hooks/)
 

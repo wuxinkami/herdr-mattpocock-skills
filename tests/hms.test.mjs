@@ -1,12 +1,14 @@
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
-import { executionMetadata, makeSnapshot, renderPatch } from '../skills/herdr-mattpocock-skills/scripts/hms.mjs';
+import { executionMetadata, makeSnapshot, renderPatch, stamp } from '../skills/herdr-mattpocock-skills/scripts/hms.mjs';
 import { commandProblems } from '../skills/herdr-mattpocock-skills/scripts/routing.mjs';
+import { stateFile } from '../skills/herdr-mattpocock-skills/scripts/store.mjs';
 
 const skillsDir = fileURLToPath(new URL('../skills/', import.meta.url));
 const hms = path.join(skillsDir, 'herdr-mattpocock-skills/scripts/hms.mjs');
@@ -16,6 +18,7 @@ const secretaryRow = '| main-session | codex | host-model | max | secretary（�
 const teamStart = `${header}\n| --- | --- | --- | --- | --- |\n${secretaryRow}\n`;
 const files = dir => fs.readdirSync(dir, { withFileTypes: true }).flatMap(e =>
   e.isDirectory() ? files(path.join(dir, e.name)) : [path.join(dir, e.name)]).sort();
+const teamFiles = (f, record) => [f.config, record, stateFile(f.project), path.join(path.dirname(stateFile(f.project)), '.gitignore')].sort();
 const refFile = (env, id) => {
   assert.match(id, /^(ctx|hms):[A-Za-z0-9_-]{12}$/);
   return path.join(env.XDG_STATE_HOME, 'hms', 'refs', id.replace(':', '-') + '.json');
@@ -103,7 +106,10 @@ function fixture(t, { tool = {}, role = {}, output, fail = false } = {}) {
   const init = (extra = []) => run(['init', '--title', '排障信息',
     '--host', 'codex', '--host-model', 'host-model', '--host-effort', 'max', '--session-id', 'main-session', ...extra]);
   const team = (extra = []) => init(['--mode', 'complex', ...extra]);
-  const read = r => fs.readFileSync(r.record, 'utf8');
+  const read = r => {
+    const index = fs.readFileSync(r.record, 'utf8');
+    return index.slice(index.indexOf(header));
+  };
   const sent = () => fs.existsSync(calls) ? fs.readFileSync(calls, 'utf8').trim().split('\n').map(JSON.parse) : [];
   return { dir, project, agent, config, calls, socket, env, command, run, init, team, read, sent, ref: id => loadRef(env, id) };
 }
@@ -114,13 +120,20 @@ test('每轮团队只有一份含身份的会话表，确认与参数预览沿�
   assert.match(path.basename(r.record), /^\d{8}-\d{6}-排障信息\.md$/);
   assert.equal(path.dirname(r.record), path.join(f.project, '.agents/herdr/session'));
   assert.equal(f.read(r), teamStart);
+  assert.match(r.round, /^rnd:[A-Za-z0-9_-]{12}$/);
+  const index = fs.readFileSync(r.record, 'utf8');
+  assert.ok(index.includes(r.round) && index.includes('codex resume main-session'));
+  assert.equal(fs.readFileSync(stateFile(f.project)).subarray(0, 16).toString(), 'SQLite format 3\u0000');
   const confirmed = f.run(['record', 'confirm', '--context', r.context, '--confirmed', '同意当前配置']);
   assert.equal(confirmed.record, r.record);
   assert.notEqual(confirmed.context, r.context);
   assert.equal(f.ref(r.context).confirmed, false);
   assert.equal(f.ref(confirmed.context).confirmed, true);
   f.run(['argv', 'searcher', '--context', confirmed.context, '--headless']);
-  assert.deepEqual(files(f.project), [f.config, r.record]);
+  assert.deepEqual(files(f.project), teamFiles(f, r.record));
+  fs.unlinkSync(r.record);
+  assert.equal(f.run(['ls', '--round', r.round]).context, confirmed.context);
+  assert.equal(fs.readFileSync(r.record, 'utf8'), index);
 });
 
 test('短 context 跨工作目录读取同一快照，缺失的短 ID 在派工前报错', t => {
@@ -230,7 +243,7 @@ test('显式面板通过 Herdr 直接收到原文并登记原生 ID，不用派�
   assert.ok(!dispatched[3].includes('读取派工文件'));
   assert.ok(dispatched.includes('--wait') && dispatched.includes('working'));
   assert.ok(f.read(r).includes('| visible-session | mock | observed-model | high | frontend（前端实现） |'));
-  assert.deepEqual(files(f.project), [f.config, r.record]);
+  assert.deepEqual(files(f.project), teamFiles(f, r.record));
 });
 
 test('匿名 CLI 成功后登记身份，退出非零时保留诊断和退出码', t => {
@@ -249,7 +262,10 @@ test('匿名 CLI 成功后登记身份，退出非零时保留诊断和退出码
     assert.doesNotMatch(prompt, /roles\/searcher\.md/);
     const member = '| anonymous-session | mock | actual-model | high | searcher（搜索与研究） |\n';
     assert.equal(f.read(r), teamStart + (fail ? '' : member));
-    assert.deepEqual(files(f.project), [f.config, r.record]);
+    const tracked = f.run(['ls', '--round', r.round, '--run', result.run]);
+    assert.equal(tracked.status, fail ? 'failed' : 'completed');
+    assert.equal(tracked.prompt, body);
+    assert.deepEqual(files(f.project), teamFiles(f, r.record));
   }
 });
 
@@ -262,7 +278,7 @@ test('PM 保留配置确认边界，显式启动失败不登记', t => {
   f.env.HMS_TEST_FAIL_START = '1';
   f.run(['spawn', 'pm', '--context', confirmed.context, '--name', 'new-pm', '--task', 'implement', '--prompt', '执行已批准任务'], 1);
   assert.equal(f.read(r), teamStart);
-  assert.deepEqual(files(f.project), [f.config, r.record]);
+  assert.deepEqual(files(f.project), teamFiles(f, r.record));
 });
 
 test('Claude 原生结果记录实际模型映射，未核实的 effort 不冒充实际值', t => {
@@ -285,7 +301,7 @@ test('启动失败或没有返回原生 ID 的 CLI 不登记', t => {
   assert.equal(result.sessionId, null);
   assert.equal(result.recorded, false);
   assert.equal(f.read(r), teamStart);
-  assert.deepEqual(files(f.project), [f.config, r.record]);
+  assert.deepEqual(files(f.project), teamFiles(f, r.record));
   const idless = fixture(t, { output: "console.log('ok');" });
   const team = idless.team();
   const success = idless.run(['run', 'searcher', '--context', team.context, '--task', 'no-id', '--prompt', '只读']);
@@ -305,7 +321,7 @@ test('原生与直接 CLI 可以补登记在同一表里，不创建另一轮记
   assert.equal(f.run([...add, '--session-id', 'dsh-session']).added, true);
   assert.ok(f.read(r).includes('| native-session | codex | native-model | high | reviewer（审查） |'));
   assert.ok(f.read(r).includes('| dsh-session | dsh | 未核实 | 未核实 | searcher（搜索与研究） |'));
-  assert.deepEqual(files(f.project), [f.config, r.record]);
+  assert.deepEqual(files(f.project), teamFiles(f, r.record));
 });
 
 test('显式面板有 ID 但首条任务没有开始时不登记', t => {
@@ -315,6 +331,10 @@ test('显式面板有 ID 但首条任务没有开始时不登记', t => {
   const result = f.run(['spawn', 'frontend', '--context', r.context, '--task', 'draft', '--prompt', '测试'], 1);
   assert.match(result.stderr, /无法确认首条任务已开始/);
   assert.equal(f.read(r), teamStart);
+  const { runs, sessions } = f.run(['ls', '--round', r.round]);
+  assert.equal(runs.length, 1);
+  assert.deepEqual([runs[0].task, runs[0].startup, runs[0].sessionId], ['draft', 'unconfirmed', null]);
+  assert.deepEqual(sessions.map(row => row[0]), ['main-session']);
 });
 
 test('启动时等待交互的面板在补发确认后登记一次', t => {
@@ -407,7 +427,7 @@ test('并行调用只追加同一表，跨 worktree 仍使用父任务记录', a
   })));
   assert.equal(f.read(r).trim().split('\n').length, 11);
   for (let i = 0; i < 8; i++) assert.ok(f.read(r).includes(`| 任务-${i} |`));
-  assert.deepEqual(files(f.project), [f.config, r.record]);
+  assert.deepEqual(files(f.project), teamFiles(f, r.record));
   assert.deepEqual(files(worktree), []);
 });
 
@@ -489,29 +509,29 @@ test('转团队时首次建表，保留临时配置，重试升级复用本团�
   assert.equal(f.run(['record', 'confirm', '--context', team.context, '--on', 'frontend', '--confirmed', '纯前端']).record, team.record);
   assert.match(f.run(['record', 'confirm', '--context', team.context, '--on', 'backend', '--confirmed', '跨端'], 1).stderr, /需要 backend/);
   assert.equal(f.read(team), teamStart);
-  assert.deepEqual(files(f.project), [f.config, team.record]);
+  assert.deepEqual(files(f.project), teamFiles(f, team.record));
 });
 
 test('继续确认和补登旧路径团队表时沿用同一份表', t => {
   const f = fixture(t);
   const simple = f.init();
   const promote = ['record', 'update', '--context', simple.context, '--mode', 'complex'];
-  const team = f.run(promote);
-  const legacy = path.join(path.dirname(f.config), path.basename(team.record));
-  fs.renameSync(team.record, legacy);
+  const snap = f.ref(simple.context);
+  const suffix = crypto.createHash('sha256').update(snap.roundId).digest('hex').slice(0, 12);
+  const legacy = path.join(path.dirname(f.config), `${stamp(new Date(snap.createdAt))}-${snap.title}-${suffix}.md`);
   const oldTable = `${legacyHeader}\n| --- | --- | --- | --- |\n| main-session | codex | host-model | max |\n| 未取得 | dsh | 未核实 | 未核实 |\n`;
   fs.writeFileSync(legacy, oldTable);
 
-  const snap = f.ref(team.context);
-  const context = Buffer.from(JSON.stringify({ ...snap, record: legacy })).toString('base64url');
-  assert.equal(f.run(promote).record, legacy);
+  const team = f.run(promote);
+  assert.equal(team.record, legacy);
+  const context = Buffer.from(JSON.stringify(f.ref(team.context))).toString('base64url');
   const confirmed = f.run(['record', 'confirm', '--context', context, '--confirmed', '同意当前配置']);
   assert.equal(confirmed.record, legacy);
   f.run(['record', 'add', '--context', confirmed.context, '--tool', 'codex', '--session-id', 'native-session']);
   assert.equal(f.run(['record', 'add', '--mode', 'complex', '--record', legacy, '--tool', 'dsh']).added, false);
-  assert.equal(fs.readFileSync(legacy, 'utf8'), oldTable + '| native-session | codex | 未核实 | 未核实 |\n');
+  assert.equal(f.read(team), teamStart + '| native-session | codex | 未核实 | 未核实 | 未核实 |\n');
   assert.deepEqual(f.run(['ls', '--record', legacy]).sessions.map(row => row[0]), ['main-session', 'native-session']);
-  assert.deepEqual(files(f.project), [legacy, f.config]);
+  assert.deepEqual(files(f.project), teamFiles(f, legacy));
 });
 
 test('旧简单 context 停止追加历史表，转团队另起一表', t => {
@@ -571,6 +591,7 @@ function multiSessionFixture(t, { sessions, roles = {}, env: extraEnv = {} } = {
     running: cfg.running !== false,
     seq: 0,
     splitIds: [...(cfg.splitIds ?? [])],
+    launches: cfg.launches,
     panes: cfg.panes.map(p => ({ cwd: project, foreground_cwd: project, closed: false, ...p })),
   }]));
   fs.writeFileSync(stateFile, JSON.stringify({ sessions: initialSessions }, null, 2));
@@ -658,11 +679,14 @@ function multiSessionFixture(t, { sessions, roles = {}, env: extraEnv = {} } = {
     } else if (a[0] === 'pane' && a[1] === 'run') {
       const pane = findPane(a[2]);
       if (!pane) fail('pane_not_found', 'pane not found');
-      pane.agent = 'mock';
+      const launch = session.launches?.[a[3].split(' ', 1)[0]];
+      pane.agent = launch?.agent ?? 'mock';
       pane.agent_status = 'idle';
-      pane.agent_session = { value: 'session-' + sessionName + '-' + pane.pane_id };
-      pane.agent_model = { value: 'observed-model' };
-      pane.agent_effort = { value: 'high' };
+      const words = a[3].split(' ');
+      const resumed = words[1] === 'resume' ? words.at(-1) : words[1] === '--resume' ? words[2] : null;
+      pane.agent_session = { value: resumed ?? ('session-' + sessionName + '-' + pane.pane_id) };
+      pane.agent_model = { value: launch?.model ?? 'observed-model' };
+      pane.agent_effort = { value: launch?.effort ?? 'high' };
       save();
       result = { ok: true };
     } else if (a[0] === 'agent' && a[1] === 'rename') {
@@ -739,6 +763,129 @@ function multiSessionFixture(t, { sessions, roles = {}, env: extraEnv = {} } = {
   };
   return { dir, project, sockets, run, calls, clearCalls, state, mutateState, ref: id => loadRef(baseEnv, id) };
 }
+
+test('同轮页面原型借用前端配置，普通 grilling 仍用 Wayfinder 配置', t => {
+  const wayfinder = { tool: 'codex', model: 'test-grilling-model', effort: 'high', carrier: 'herdr' };
+  const frontend = { tool: 'claude-code', model: 'test-prototype-model', effort: 'max', carrier: 'herdr', place: 'tab' };
+  const f = multiSessionFixture(t, {
+    roles: { wayfinder, frontend },
+    sessions: { main: {
+      panes: [{ pane_id: 'w1:p4', workspace_id: 'w1', tab_id: 'w1:t4', terminal_id: 'term-secretary',
+        agent: 'codex', agent_status: 'idle', agent_session: { value: 'secretary-thread' }, matchCaller: true }],
+      launches: { claude: { ...frontend, agent: 'claude' }, codex: { ...wayfinder, agent: 'codex' } },
+    } },
+  });
+  const { tools } = JSON.parse(fs.readFileSync(path.join(skillsDir, 'herdr-setup/templates/routing.json'), 'utf8'));
+  const routing = path.join(f.project, '.agents/herdr/routing.json');
+  const config = JSON.parse(fs.readFileSync(routing, 'utf8'));
+  Object.assign(config.tools, { codex: tools.codex, 'claude-code': tools['claude-code'] });
+  fs.writeFileSync(routing, JSON.stringify(config));
+  const env = { CODEX_THREAD_ID: 'secretary-thread', HERDR_SOCKET_PATH: f.sockets.main, HERDR_PANE_ID: 'w1:p4' };
+  const team = f.run(['init', '--mode', 'complex', '--off', 'frontend', '--confirmed', '确认团队配置',
+    '--set', 'frontend.model=round-frontend-model', '--host-model', 'secretary-model', '--host-effort', 'high'], { env });
+  const original = f.ref(team.context);
+  assert.equal(original.roleConfig.frontend.enabled, false);
+  const context = ['--context', team.context];
+  const route = ['--route-from', 'frontend'];
+
+  const prototype = f.run(['argv', 'wayfinder', ...context, ...route]);
+  assert.match(prototype.argv[2], /^[\da-f-]{36}$/);
+  assert.deepEqual(prototype.argv, ['claude', '--session-id', prototype.argv[2], '--model', frontend.model, '--effort', frontend.effort]);
+  const page = f.run(['spawn', 'wayfinder', ...context, ...route, '--task', 'prototype', '--prompt', '讨论页面交互原型'], { env });
+
+  const grilling = f.run(['argv', 'wayfinder', ...context]);
+  assert.deepEqual(grilling.argv, ['codex', '--model', wayfinder.model, '-c', `model_reasoning_effort="${wayfinder.effort}"`]);
+  const discussion = f.run(['spawn', 'wayfinder', ...context, '--task', 'grilling', '--prompt', '讨论普通决策票'], { env });
+
+  assert.notEqual(page.pane, discussion.pane);
+  const stripGeneratedId = command => command.replace(/--session-id [\da-f-]{36}\b/, '--session-id <id>');
+  const launches = f.calls().map(c => c.args).filter(([area, action]) => area === 'pane' && action === 'run');
+  assert.deepEqual(launches.map(([, , pane, command]) => [pane, stripGeneratedId(command)]),
+    [[page.pane, stripGeneratedId(prototype.shell)], [discussion.pane, grilling.shell]]);
+  const table = fs.readFileSync(team.record, 'utf8').split('\n');
+  for (const [worker, preview, executable] of [[page, prototype, 'claude'], [discussion, grilling, 'codex']]) {
+    const { role, tool, model, effort } = preview;
+    assert.deepEqual([worker.role, worker.tool, worker.model, worker.effort, worker.record, worker.recorded, worker.delivered],
+      ['wayfinder', tool, model, effort, team.record, true, true]);
+    assert.equal(role, 'wayfinder');
+    assert.ok(table.includes(`| ${worker.sessionId} | ${executable} | ${model} | ${effort} | wayfinder（一张决策票） |`));
+    const pane = f.state().sessions.main.panes.find(p => p.pane_id === worker.pane);
+    assert.match(pane.prompts[0], /^wayfinder · /);
+    assert.ok(pane.prompts[0].includes(`--context ${team.context}`));
+    assert.ok(pane.prompts[0].includes('--role wayfinder --status completed'));
+  }
+  assert.deepEqual(f.ref(team.context), original);
+  assert.deepEqual(fs.readdirSync(path.dirname(team.record)), [path.basename(team.record)]);
+});
+
+test('重启后秘书恢复 Codex 和 Claude 的未完工会话，原回报地址跟随已核实的发起者', t => {
+  const secretary = { pane_id: 'w1:p4', workspace_id: 'w1', tab_id: 'w1:t4', terminal_id: 'old-secretary',
+    agent: 'codex', agent_status: 'idle', agent_session: { value: 'secretary-thread' }, matchCaller: true };
+  const pm = { tool: 'codex', model: 'pm-model', effort: 'high', carrier: 'herdr' };
+  const frontend = { tool: 'claude-code', model: 'worker-model', effort: 'max', carrier: 'herdr' };
+  const f = multiSessionFixture(t, { roles: { pm, frontend }, sessions: {
+    main: { panes: [secretary], launches: { codex: { ...pm, agent: 'codex' }, claude: { ...frontend, agent: 'claude' } } },
+    default: { panes: [{ ...secretary, terminal_id: 'decoy', agent_session: { value: 'unrelated-thread' }, matchCaller: false }] },
+  } });
+  for (const exe of ['codex', 'claude']) fs.writeFileSync(path.join(f.dir, 'bin', exe), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+  const { tools } = JSON.parse(fs.readFileSync(path.join(skillsDir, 'herdr-setup/templates/routing.json'), 'utf8'));
+  const routing = path.join(f.project, '.agents/herdr/routing.json');
+  const config = JSON.parse(fs.readFileSync(routing, 'utf8'));
+  Object.assign(config.tools, { codex: tools.codex, 'claude-code': tools['claude-code'] });
+  fs.writeFileSync(routing, JSON.stringify(config));
+  const env = { CODEX_THREAD_ID: 'secretary-thread', HERDR_SOCKET_PATH: f.sockets.main, HERDR_PANE_ID: secretary.pane_id };
+  const team = f.run(['init', '--mode', 'complex', '--title', '重启恢复', '--confirmed', '同意'], { env });
+  const spawn = (role, task) => ['spawn', role, '--context', team.context, '--task', task, '--prompt', `处理 ${task}`];
+  const parent = f.run(spawn('pm', '协调'), { env });
+  const parentEnv = { ...env, HERDR_PANE_ID: parent.pane, CODEX_THREAD_ID: parent.sessionId };
+  f.mutateState(s => {
+    s.sessions.main.panes.forEach(p => { p.matchCaller = p.pane_id === parent.pane; });
+  });
+  const child = f.run(spawn('frontend', '实现'), { env: parentEnv });
+  const done = f.run(spawn('wayfinder', '已完成'), { env: parentEnv });
+  const reply = worker => /notify --to (hms:[A-Za-z0-9_-]+)/.exec(
+    f.state().sessions.main.panes.find(p => p.pane_id === worker.pane).prompts[0])[1];
+  const notify = (worker, status, summary) => ['notify', '--to', reply(worker), '--task', worker.task,
+    '--role', worker.role, '--status', status, '--summary', summary, '--wait-ms', '0'];
+  f.run(notify(done, 'completed', '已确认'), { env });
+
+  const afterRestart = { ...secretary, pane_id: 'w1:p9', tab_id: 'w1:t9', terminal_id: 'new-secretary' };
+  f.mutateState(s => {
+    s.sessions.main.panes.forEach(p => { p.closed = true; });
+    s.sessions.main.panes.push(afterRestart);
+  });
+  const resumedEnv = { ...env, HERDR_PANE_ID: afterRestart.pane_id };
+  const resultText = "结果待交接\n含管道 | 和单引号 '";
+  const report = notify(child, 'blocked', resultText);
+  assert.match(f.run(report, { env: resumedEnv, expected: 1 }).stderr, /未送达/);
+  fs.unlinkSync(refFile({ XDG_STATE_HOME: path.join(f.dir, 'state') }, team.context));
+
+  f.clearCalls();
+  const recover = ['recover', '--round', team.round];
+  const recovered = f.run(recover, { env: resumedEnv });
+  assert.equal(recovered.context, team.context);
+  assert.deepEqual(recovered.workers.map(w => [w.sessionId, w.state]), [[parent.sessionId, 'resumed'], [child.sessionId, 'resumed']]);
+  assert.deepEqual(recovered.manual, []);
+  assert.deepEqual(recovered.pendingReports.map(r => [r.run, r.summary]), [[child.run, resultText]]);
+  const launches = f.calls().filter(c => c.args[0] === 'pane' && c.args[1] === 'run').map(c => c.args[3]);
+  assert.match(launches[0], /^codex resume --model pm-model /);
+  assert.ok(launches[0].endsWith(parent.sessionId));
+  assert.equal(launches[1], `claude --resume ${child.sessionId} --model worker-model --effort max`);
+  assert.ok(!f.calls().some(c => c.args[0] === 'agent' && c.args[1] === 'prompt'));
+  const resumedParent = f.ref(recovered.workers[0].address);
+  assert.notEqual(resumedParent.pane, parent.pane);
+  assert.equal(f.run(report, { env: resumedEnv }).to, resumedParent.pane);
+  assert.equal(f.run(report, { env: resumedEnv }).reused, true);
+  const prompts = f.state().sessions.main.panes.find(p => p.pane_id === resumedParent.pane).prompts;
+  assert.equal(prompts.length, 1);
+  assert.ok(prompts[0].includes(resultText));
+
+  f.clearCalls();
+  const repeated = f.run(recover, { env: resumedEnv });
+  assert.deepEqual(repeated.pendingReports, []);
+  assert.ok(repeated.workers.every(w => w.state === 'live'));
+  assert.ok(!f.calls().some(c => c.args[0] === 'pane' && c.args[1] === 'split'));
+});
 
 test('手动 Codex 的启动 hook 和 HMS 从实时状态栏核对自身，在共享 app-server 下也只在自己的标签页分屏', t => {
   const mainThread = '01a10000-0000-7000-8000-000000000001';

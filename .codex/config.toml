@@ -1,2 +1,2 @@
 [tui]
-status_line = ["thread-id"]
+status_line = ["thread-id", "model-with-reasoning", "context-remaining", "current-dir", "git-branch", "context-used", "run-state", "context-window-size", "total-input-tokens", "total-output-tokens", "fast-mode", "task-progress"]

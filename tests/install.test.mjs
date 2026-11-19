@@ -161,6 +161,30 @@ test('全局安装只配置用户目录，项目安装只写项目且继承用�
   assert.ok(read(projectConfig).includes('tui.status_line_use_colors = true'));
 });
 
+test('重新安装会用用户状态栏补全旧项目的 thread-id 数组', t => {
+  const { project, profile, run } = fixture(t);
+  const userConfig = path.join(profile, '.codex', 'config.toml');
+  const projectDir = path.join(project, '.codex');
+  const projectConfig = path.join(projectDir, 'config.toml');
+  const items = ['model-with-reasoning', 'context-remaining', 'current-dir', 'git-branch', 'context-used', 'run-state',
+    'context-window-size', 'total-input-tokens', 'total-output-tokens', 'fast-mode', 'task-progress'];
+  const userText = `[tui]\nstatus_line = ${JSON.stringify(items)}\n`;
+  const old = '[tui]\nstatus_line = [\n  "thread-id", # Keep this note\n]\nstatus_line_use_colors = false\n';
+  put(userConfig, userText);
+  const args = ['install', '--agent', 'codex', '--project', project];
+  for (const extraEnv of [{}, { CODEX_HOME: projectDir }]) {
+    put(projectConfig, old);
+    run(args, { extraEnv });
+    assert.deepEqual(statusLine(projectConfig), ['thread-id', ...items]);
+    const updated = read(projectConfig);
+    assert.ok(updated.includes('# Keep this note\n'));
+    assert.ok(updated.includes('status_line_use_colors = false\n'));
+    run(args, { extraEnv });
+    assert.equal(read(projectConfig), updated);
+    assert.equal(read(userConfig), userText);
+  }
+});
+
 test('合并前发现 Codex 配置无效时保留文件并中止安装', t => {
   const { project, run } = fixture(t);
   const args = ['install', '--agent', 'codex', '--project', project];
