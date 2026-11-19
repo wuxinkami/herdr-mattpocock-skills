@@ -10,7 +10,7 @@ disable-model-invocation: true
 
 ## 开一轮
 
-有本轮 `context` 就沿用。首次调用运行 `hms config`，已激活即按所选模式继续，未激活才按返回的 `skillFile` 调用 `$herdr-setup`。
+有本轮 `ctx:…` 短 ID 就沿用，传给 `--context`。首次调用运行 `hms config`，已激活即按所选模式继续，未激活才按返回的 `skillFile` 调用 `$herdr-setup`。
 
 **简单模式（默认）**。主 agent 对话、做后端和调度。首次派工用 `hms init --title "$title"`，取返回的 `context`。有前端任务才 `spawn frontend`，同轮复用，做完由主 agent 关闭。
 
@@ -43,7 +43,8 @@ hms notify --to "$reply_address" --task "$task" --role "$role" --status complete
 hms close "$address"
 ```
 
-- `spawn` 在发起面板所属的 Herdr 会话、工作区和标签页分屏。返回的 `address` 绑定 socket 和面板，用于续发或关闭。`delivered: false` 时先处理面板等待项，再用 `prompt` 补发返回的完整正文。成员再派工用随任务收到的 `--parent`。票级新实现者加 `--fresh --cwd "$worktree"`，沿用本轮 context。查主项目配置加 `--project "$project"`。
+- `spawn` 在发起面板所属的 Herdr 会话、工作区和标签页分屏。返回的 `address` 是绑定 socket 和面板的 `hms:…` 短 ID，用于续发或关闭。`delivered: false` 时先处理面板等待项，再用 `prompt` 补发返回的完整正文。再派工和回报照抄收到的 `--parent` 和 `--to` 短 ID。票级新实现者加 `--fresh --cwd "$worktree"`，沿用本轮 context。查主项目配置加 `--project "$project"`。
+- 团队显式成员在 Herdr 观察到首条任务活动并取得原生会话 ID 后登记，处理等待项后用原地址补发同样适用。首条任务确认超时时，先检查面板是否已收到任务或留下草稿。任务已开始但返回 `recorded: false` 时，核实 ID 后用 `record add` 补登。
 - 用任务正文附带的 `notify` 回报，状态可填 `completed`、`blocked`、`failed`。发起者等待审批时最多等一分钟，超时保留面板和结果供重发。
 - 等发送方结束回合后关闭。团队 PM 关自己的成员，秘书关 PM 和逐票 wayfinder。借用面板保留，明确移交管理时用 `hms close "$pane" --takeover`。
 
@@ -52,15 +53,15 @@ hms close "$address"
 ```bash
 hms native "$role" --context "$context" --caller "$tool" --caller-model "$model" --task "$task" --prompt "$prompt"
 hms run "$role" --context "$context" --task "$task" --prompt "$prompt"
-hms record add --context "$context" --tool "$tool" --session-id "$id" --model "$model" --effort "$effort"
+hms record add --context "$context" --role "$role" --tool "$tool" --session-id "$id" --model "$model" --effort "$effort"
 ```
 
-同工具同型号且宿主可落实等级、目录和上下文时，用 `native` 返回的参数派原生子 agent，由宿主接收结果并在团队中用 `record add` 补登。其他情况用 `run`，输出直返。两者都可加 `--cwd "$dir"`。
+同工具同型号且宿主可落实等级、目录和上下文时，用 `native` 返回的参数派原生子 agent，由宿主接收结果，成功后在团队中用 `record add` 登记实际会话 ID。其他情况用 `run`，输出直返，成功退出且返回原生 ID 时自动登记。两者都可加 `--cwd "$dir"`。
 
 ## 同轮配置与排障
 
 - 用 `hms resolve --context "$context"` 加 `--set 角色.tool=CLI`、`--set 角色.model=型号`、`--set 角色.effort=等级` 或 `--on`、`--off` 预览变更。临时换 CLI 沿用项目为该 CLI 配置的唯一型号，否则问一次，可选 `default`。
 - 用 `hms record update --context "$context" --confirmed "$reply"` 加相同选项更新。已经确认的团队只补确认变化项，用户点名即确认。只登记答复用 `hms record confirm --context "$context" --confirmed "$reply"`。以后续返回的 context 为准。
-- 简单模式转团队用 `hms record update --context "$context" --mode complex` 并带上所需角色，沿用临时配置。展示配置并确认，原前端交接后再开 PM。团队每轮一张 `.agents/herdr/session/<时间戳>-<标题>.md`，登记会话 ID、工具、实际模型和思考等级。升级前的调用无需补记，未知值照实填。
+- 简单模式转团队用 `hms record update --context "$context" --mode complex` 并带上所需角色，沿用临时配置。展示配置并确认，原前端交接后再开 PM。团队每轮一张 `.agents/herdr/session/<时间戳>-<标题>.md`，登记会话 ID、工具、实际模型、思考等级及身份。实际模型和等级未知时填「未核实」。
 - 手动启动的 Codex 使用共享 app-server 时，HMS 用当前线程 ID 匹配各 Herdr 会话的可见状态栏。定位失败时请用户在当前 Codex 的 `/statusline` 启用 `thread-id` 并移到最前，让完整 ID 显示在面板底部，然后运行 `hms where`。`--herdr-session` 是 Herdr 会话名，如 `main`。`--parent` 接受 `where` 返回的地址或面板 ID。`--session-id` 是 agent 的原生会话 ID。旧地址缺少 socket 时，可用 `--herdr-session` 指定对应会话。
 - 查启动参数用 `hms argv "$role" --context "$context"`，可加 `--headless` 或 `--fresh`。查团队表及在线成员用 `hms ls --record "$record"`，可用 `--herdr-session "$herdr_session"` 指定会话。

@@ -37,6 +37,7 @@ export function configuredRoles(config) {
       if (parent.inherit) role.inherit = parent.inherit;
       else delete role.inherit;
     }
+    if (config.tools?.codex && toolId(config.tools, role.tool) === 'codex') role.tool = 'codex';
   }
   delete roles.griller;
   delete roles.checker;
@@ -49,6 +50,23 @@ export function toolId(tools, name) {
   if (Object.hasOwn(tools, name)) return name;
   const id = name.trim().toLowerCase();
   return Object.keys(tools).find(key => key.toLowerCase() === id || tools[key]?.aliases?.some(alias => alias.toLowerCase() === id));
+}
+
+function officialCodex(tool) {
+  const { aliases, preferredExecutables, fallbackExecutables, ...adapter } = tool;
+  for (const mode of ['interactive', 'headless']) {
+    const argv = adapter[mode];
+    if (Array.isArray(argv) && argv.length) adapter[mode] = ['codex', ...argv.slice(1)];
+  }
+  if (adapter.options) {
+    adapter.options = Object.fromEntries(Object.entries(adapter.options).map(([mode, options]) =>
+      [mode, options && officialCodex(options)]));
+  }
+  return adapter;
+}
+
+export function configuredTools(tools) {
+  return tools?.codex ? { ...tools, codex: officialCodex(tools.codex) } : tools;
 }
 
 // 按执行方式判断，某些 CLI 只有无头模式支持指定模型变体。

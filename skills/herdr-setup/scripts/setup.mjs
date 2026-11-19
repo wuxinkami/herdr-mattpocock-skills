@@ -2,7 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
-import { commandProblems, configuredRoles, projectRoot, projectConfigPath, readRouting, toolId } from '../../herdr-mattpocock-skills/scripts/routing.mjs';
+import { commandProblems, configuredRoles, configuredTools, projectRoot, projectConfigPath, readRouting, toolId } from '../../herdr-mattpocock-skills/scripts/routing.mjs';
 
 const template = JSON.parse(fs.readFileSync(new URL('../templates/routing.json', import.meta.url), 'utf8'));
 const object = v => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -46,7 +46,7 @@ const oldCommands = {
   dsh: { interactive: 'dsh --profile tui {patch}', headless: 'dsh --profile headless {patch} {prompt}' },
 };
 
-function projectCatalog(saved) {
+function projectCatalog(saved, overrides) {
   const selected = structuredClone(saved.tools ?? {});
   if ((saved.schemaVersion ?? 0) < template.schemaVersion) {
     for (const [id, fields] of Object.entries(oldCommands)) {
@@ -61,14 +61,14 @@ function projectCatalog(saved) {
   for (const [id, tool] of Object.entries(selected)) {
     if (template.tools[id]?.aliases) catalog[id].aliases = [...new Set([...template.tools[id].aliases, ...(tool.aliases ?? [])])];
   }
-  return catalog;
+  return configuredTools(mergeOptions(catalog, overrides));
 }
 
 function activate(previous, answers) {
   if (!object(answers) || !object(answers.roles)) throw new Error('请提供 roles 对象，各行填写 tool、model 和可选的 effort');
   if (answers.tools !== undefined && !object(answers.tools)) throw new Error('tools 需要 CLI 适配对象');
   const saved = previous.config ?? {};
-  const catalog = mergeOptions(projectCatalog(saved), answers.tools);
+  const catalog = projectCatalog(saved, answers.tools);
   const oldRoles = configuredRoles(saved);
   const roles = previous.active ? { ...oldRoles } : {};
   roles.secretary = { ...template.roles.secretary, model: 'inherit', effort: 'inherit' };

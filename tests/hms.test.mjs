@@ -10,9 +10,17 @@ import { commandProblems } from '../skills/herdr-mattpocock-skills/scripts/routi
 
 const skillsDir = fileURLToPath(new URL('../skills/', import.meta.url));
 const hms = path.join(skillsDir, 'herdr-mattpocock-skills/scripts/hms.mjs');
-const header = '| 会话 ID | Agent 工具 | 实际模型 | 思考等级 |';
+const legacyHeader = '| 会话 ID | Agent 工具 | 实际模型 | 思考等级 |';
+const header = '| 会话 ID | Agent 工具 | 实际模型 | 思考等级 | 身份 |';
+const secretaryRow = '| main-session | codex | host-model | max | secretary（用户沟通与建图） |';
+const teamStart = `${header}\n| --- | --- | --- | --- | --- |\n${secretaryRow}\n`;
 const files = dir => fs.readdirSync(dir, { withFileTypes: true }).flatMap(e =>
   e.isDirectory() ? files(path.join(dir, e.name)) : [path.join(dir, e.name)]).sort();
+const refFile = (env, id) => {
+  assert.match(id, /^(ctx|hms):[A-Za-z0-9_-]{12}$/);
+  return path.join(env.XDG_STATE_HOME, 'hms', 'refs', id.replace(':', '-') + '.json');
+};
+const loadRef = (env, id) => JSON.parse(fs.readFileSync(refFile(env, id), 'utf8'));
 
 function fixture(t, { tool = {}, role = {}, output, fail = false } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hms-test-'));
@@ -43,13 +51,28 @@ function fixture(t, { tool = {}, role = {}, output, fail = false } = {}) {
       {pane_id:'w1:other',workspace_id:'w1',tab_id:'w1:tab-other',terminal_id:'term-other',agent:'codex',agent_status:'idle'},
     ]};
     if (a[0] === 'pane' && a[1] === 'process-info' && a[3] === 'w1:parent') result = {process_info:{shell_pid:process.ppid}};
+    if (a[0] === 'pane' && a[1] === 'process-info' && a[3] === 'w1:child') {
+      result = {process_info:{foreground_processes:[{pid:Number(process.env.HMS_TEST_CHILD_PID)}]}};
+    }
+    if (a[0] === 'pane' && a[1] === 'read') {
+      const previousReads = fs.readFileSync(${JSON.stringify(calls)}, 'utf8').split('\\n')
+        .filter(line => line.startsWith('["pane","read","w1:child",')).length;
+      console.log(previousReads > 1 ? (process.env.HMS_TEST_CODEX_FOOTER ?? '') : '');
+      process.exit(0);
+    }
     if (a[0] === 'pane' && a[1] === 'run' && process.env.HMS_TEST_FAIL_START) process.exit(1);
+    if (a[0] === 'agent' && a[1] === 'prompt' && a[2] === 'w1:child' && a.includes('--wait') && process.env.HMS_TEST_STALLED) {
+      console.error(JSON.stringify({error:{code:'agent_prompt_stalled',message:'no first prompt activity'}}));
+      process.exit(1);
+    }
     if (a[0] === 'agent' && a[1] === 'get') {
       if (a[2] !== 'w1:child' && a[2] !== 'w1:parent') process.exit(1);
       if (a[2] === 'w1:child' && process.env.HMS_TEST_FAIL_START) process.exit(1);
       const child = a[2] === 'w1:child';
-      result = {agent:{agent:child ? 'mock' : 'codex',agent_status:'idle',pane_id:a[2],workspace_id:'w1',tab_id:'w1:tab-parent',
-        terminal_id:child ? 'term-child' : 'term-parent',agent_session:{value:child ? 'visible-session' : 'main-session'},
+      result = {agent:{agent:child ? (process.env.HMS_TEST_CHILD_AGENT || 'mock') : 'codex',
+        agent_status:child ? (process.env.HMS_TEST_CHILD_STATUS || 'idle') : 'idle',pane_id:a[2],workspace_id:'w1',tab_id:'w1:tab-parent',
+        terminal_id:child ? 'term-child' : 'term-parent',
+        agent_session:child && process.env.HMS_TEST_NO_HERDR_ID ? undefined : {value:child ? 'visible-session' : 'main-session'},
         agent_model:{value:child ? 'observed-model' : 'host-model'},agent_effort:{value:child ? 'high' : 'max'}}};
     }
     if (a[0] === 'pane' && a[1] === 'split') result = {pane:{pane_id:'w1:child',workspace_id:'w1',tab_id:'w1:tab-parent',terminal_id:'term-child'}};
@@ -68,7 +91,7 @@ function fixture(t, { tool = {}, role = {}, output, fail = false } = {}) {
       pm: { tool: 'mock', model: 'requested-alias', effort: 'max', carrier: 'herdr' },
     },
   }));
-  const env = { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH}`, HERDR_ENV: '1',
+  const env = { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH}`, HERDR_ENV: '1', XDG_STATE_HOME: path.join(dir, 'state'),
     HERDR_SOCKET_PATH: socket, HERDR_PANE_ID: 'w1:other', HERDR_WORKSPACE_ID: 'w1', CODEX_THREAD_ID: 'main-session' };
   delete env.HERDR_SESSION;
   const command = args => [hms, ...args, '--project', project];
@@ -82,28 +105,114 @@ function fixture(t, { tool = {}, role = {}, output, fail = false } = {}) {
   const team = (extra = []) => init(['--mode', 'complex', ...extra]);
   const read = r => fs.readFileSync(r.record, 'utf8');
   const sent = () => fs.existsSync(calls) ? fs.readFileSync(calls, 'utf8').trim().split('\n').map(JSON.parse) : [];
-  return { dir, project, agent, config, calls, socket, env, command, run, init, team, read, sent };
+  return { dir, project, agent, config, calls, socket, env, command, run, init, team, read, sent, ref: id => loadRef(env, id) };
 }
 
-test('每轮团队只有一份四列表格，确认与参数预览沿用此表', t => {
+test('每轮团队只有一份含身份的会话表，确认与参数预览沿用此表', t => {
   const f = fixture(t);
   const r = f.team();
   assert.match(path.basename(r.record), /^\d{8}-\d{6}-排障信息\.md$/);
   assert.equal(path.dirname(r.record), path.join(f.project, '.agents/herdr/session'));
-  assert.equal(f.read(r), `${header}\n| --- | --- | --- | --- |\n| main-session | codex | host-model | max |\n`);
+  assert.equal(f.read(r), teamStart);
   const confirmed = f.run(['record', 'confirm', '--context', r.context, '--confirmed', '同意当前配置']);
   assert.equal(confirmed.record, r.record);
-  assert.equal(JSON.parse(Buffer.from(confirmed.context, 'base64url')).confirmed, true);
+  assert.notEqual(confirmed.context, r.context);
+  assert.equal(f.ref(r.context).confirmed, false);
+  assert.equal(f.ref(confirmed.context).confirmed, true);
   f.run(['argv', 'searcher', '--context', confirmed.context, '--headless']);
   assert.deepEqual(files(f.project), [f.config, r.record]);
+});
+
+test('短 context 跨工作目录读取同一快照，缺失的短 ID 在派工前报错', t => {
+  const f = fixture(t);
+  const { context } = f.init();
+  const snap = f.ref(context);
+  const oldContext = Buffer.from(JSON.stringify(snap)).toString('base64url');
+  assert.equal(f.run(['record', 'init', '--context', oldContext]).context, context);
+
+  const config = JSON.parse(fs.readFileSync(f.config, 'utf8'));
+  config.roles.frontend.model = 'changed-model';
+  fs.writeFileSync(f.config, JSON.stringify(config));
+  const elsewhere = spawnSync(process.execPath, [hms, 'argv', 'frontend', '--context', context], {
+    cwd: f.dir, env: f.env, encoding: 'utf8',
+  });
+  assert.equal(elsewhere.status, 0, elsewhere.stderr);
+  assert.equal(JSON.parse(elsewhere.stdout).model, snap.roleConfig.frontend.model);
+
+  const missingContext = 'ctx:xxxxxxxxxxxx';
+  const missingPane = 'hms:xxxxxxxxxxxx';
+  fs.rmSync(f.calls, { force: true });
+  const spawn = args => f.run(['spawn', 'frontend', '--task', 'short-id', '--prompt', '测试', ...args], 1);
+  assert.match(spawn(['--context', missingContext]).stderr, /找不到 HMS 短 ID ctx:/);
+  assert.match(spawn(['--context', context, '--parent', missingPane]).stderr, /找不到 HMS 短 ID hms:/);
+  assert.match(f.run(['prompt', missingPane, '--prompt', '测试'], 1).stderr, /找不到 HMS 短 ID hms:/);
+  assert.deepEqual(f.sent(), []);
+});
+
+test('本地状态无法写入时，团队初始化不留下无法引用的会话表', t => {
+  const f = fixture(t);
+  fs.writeFileSync(f.env.XDG_STATE_HOME, '状态目录不可用');
+  f.run(['init', '--mode', 'complex', '--title', '无法初始化'], 1);
+  assert.deepEqual(files(f.project), [f.config]);
+});
+
+test('Codex 的旧路由与旧 context 均启动 codex，保存路由时清理旧可执行名', t => {
+  const f = fixture(t);
+  const wrapper = 'project-codex-wrapper';
+  const bin = path.join(f.dir, 'bin');
+  fs.writeFileSync(path.join(bin, wrapper), `#!${process.execPath}\nprocess.exit(97);\n`, { mode: 0o755 });
+  fs.writeFileSync(path.join(bin, 'codex'), `#!${process.execPath}
+    console.log(JSON.stringify({ type: 'thread.started', thread_id: 'codex-test-session' }));
+  `, { mode: 0o755 });
+  const { tools: { codex } } = JSON.parse(fs.readFileSync(path.join(skillsDir, 'herdr-setup/templates/routing.json'), 'utf8'));
+  const oldAdapter = {
+    ...codex,
+    preferredExecutables: { codex: wrapper },
+    fallbackExecutables: [wrapper],
+    aliases: [wrapper],
+    options: { headless: { headless: [wrapper, ...codex.headless.slice(1)] } },
+  };
+  const config = JSON.parse(fs.readFileSync(f.config, 'utf8'));
+  config.schemaVersion = 6;
+  config.tools.codex = oldAdapter;
+  config.roles.frontend.tool = wrapper;
+  config.roles.searcher.tool = wrapper;
+  fs.writeFileSync(f.config, JSON.stringify(config));
+
+  const { context } = f.team();
+  const snapshot = f.ref(context);
+  assert.equal(snapshot.roleConfig.frontend.tool, 'codex');
+  assert.ok(!JSON.stringify(snapshot.tools.codex).includes(wrapper));
+  const legacyContext = Buffer.from(JSON.stringify({
+    ...snapshot,
+    tools: { ...snapshot.tools, codex: oldAdapter },
+    roleConfig: config.roles,
+  })).toString('base64url');
+  for (const token of [context, legacyContext]) {
+    assert.deepEqual(f.run(['argv', 'frontend', '--context', token]).argv,
+      ['codex', '--model', 'requested-alias', '-c', 'model_reasoning_effort="max"']);
+    assert.deepEqual(f.run(['argv', 'searcher', '--headless', '--context', token]).argv.slice(0, 2), ['codex', 'exec']);
+  }
+  const result = f.run(['run', 'searcher', '--context', legacyContext, '--task', '回归测试', '--prompt', '测试']);
+  assert.equal(result.sessionId, 'codex-test-session');
+
+  const setup = path.join(skillsDir, 'herdr-setup/scripts/setup.mjs');
+  const saved = spawnSync(process.execPath, [setup, 'apply', '--project', f.project], {
+    input: '{"roles":{}}', encoding: 'utf8',
+  });
+  assert.equal(saved.status, 0, saved.stderr);
+  assert.ok(!fs.readFileSync(f.config, 'utf8').includes(wrapper));
 });
 
 test('显式面板通过 Herdr 直接收到原文并登记原生 ID，不用派工文件', t => {
   const f = fixture(t);
   const r = f.team(['--confirmed', '同意当前配置']);
   const body = "核实入口\n包含 '引号'、`代码` 和 $(这不是命令)";
-  const result = f.run(['spawn', 'frontend', '--context', r.context, '--name', 'fresh-worker', '--task', '781', '--prompt', body]);
+  const legacyContext = Buffer.from(JSON.stringify(f.ref(r.context))).toString('base64url');
+  const result = f.run(['spawn', 'frontend', '--context', legacyContext, '--name', 'fresh-worker', '--task', '781', '--prompt', body]);
+  assert.match(result.address, /^hms:[A-Za-z0-9_-]{12}$/);
   assert.equal(result.sessionId, 'visible-session');
+  assert.equal(result.recorded, true);
   assert.equal(result.herdrSocket, f.socket);
   assert.equal(result.workspace, 'w1');
   assert.equal(result.tab, 'w1:tab-parent');
@@ -113,32 +222,38 @@ test('显式面板通过 Herdr 直接收到原文并登记原生 ID，不用派�
   const dispatched = f.sent().find(c => c[0] === 'agent' && c[1] === 'prompt');
   assert.ok(dispatched[3].endsWith(body));
   assert.ok(dispatched[3].includes(`--context ${r.context}`));
+  assert.match(dispatched[3], /--parent hms:[A-Za-z0-9_-]{12}\s/);
+  assert.match(dispatched[3], /--to hms:[A-Za-z0-9_-]{12}\s/);
+  assert.ok(!dispatched[3].includes(legacyContext));
   assert.match(dispatched[3], /纯前端票由你主责/);
   assert.doesNotMatch(dispatched[3], /roles\/frontend\.md/);
   assert.ok(!dispatched[3].includes('读取派工文件'));
-  assert.ok(f.read(r).includes('| visible-session | mock | observed-model | high |'));
+  assert.ok(dispatched.includes('--wait') && dispatched.includes('working'));
+  assert.ok(f.read(r).includes('| visible-session | mock | observed-model | high | frontend（前端实现） |'));
   assert.deepEqual(files(f.project), [f.config, r.record]);
 });
 
-test('匿名成功与失败调用都登记，输出直接返回并保留退出码', t => {
+test('匿名 CLI 成功后登记身份，退出非零时保留诊断和退出码', t => {
   for (const fail of [false, true]) {
     const f = fixture(t, { fail });
     const r = f.team();
     const body = "报告结论直接返回\n保留 '原文'";
     const result = f.run(['run', 'searcher', '--context', r.context, '--task', 'research', '--prompt', body], fail ? 7 : 0);
     assert.equal(result.exit, fail ? 7 : 0);
+    assert.equal(result.recorded, !fail);
     assert.ok(result.stdout.includes('anonymous-session'));
     const events = result.stdout.trim().split('\n').map(JSON.parse);
     const prompt = events.at(-1).item.text;
     assert.ok(prompt.endsWith(body));
     assert.match(prompt, /承担搜索、代码探索或 research/);
     assert.doesNotMatch(prompt, /roles\/searcher\.md/);
-    assert.ok(f.read(r).includes('| anonymous-session | mock | actual-model | high |'));
+    const member = '| anonymous-session | mock | actual-model | high | searcher（搜索与研究） |\n';
+    assert.equal(f.read(r), teamStart + (fail ? '' : member));
     assert.deepEqual(files(f.project), [f.config, r.record]);
   }
 });
 
-test('PM 保留配置确认边界，显式启动失败同样登记', t => {
+test('PM 保留配置确认边界，显式启动失败不登记', t => {
   const f = fixture(t);
   const r = f.team();
   f.run(['spawn', 'pm', '--context', r.context, '--name', 'new-pm', '--task', 'implement', '--prompt', '执行已批准任务'], 1);
@@ -146,35 +261,112 @@ test('PM 保留配置确认边界，显式启动失败同样登记', t => {
   const confirmed = f.run(['record', 'confirm', '--context', r.context, '--confirmed', '同意当前配置']);
   f.env.HMS_TEST_FAIL_START = '1';
   f.run(['spawn', 'pm', '--context', confirmed.context, '--name', 'new-pm', '--task', 'implement', '--prompt', '执行已批准任务'], 1);
-  assert.ok(f.read(r).includes('| 未取得 | mock | 未核实 | 未核实 |'));
+  assert.equal(f.read(r), teamStart);
   assert.deepEqual(files(f.project), [f.config, r.record]);
 });
 
 test('Claude 原生结果记录实际模型映射，未核实的 effort 不冒充实际值', t => {
-  const f = fixture(t, { tool: { metadata: 'claude-code' }, output: `console.log(JSON.stringify({type:'result',session_id:'claude-session',result:'ok',modelUsage:{'deepseek-v4.1-flash':{}}}));` });
-  const r = f.team();
-  f.run(['run', 'searcher', '--context', r.context, '--task', 'claude', '--prompt', '只读']);
-  assert.ok(f.read(r).includes('| claude-session | mock | deepseek-v4.1-flash | 未核实 |'));
+  for (const failed of [false, true]) {
+    const f = fixture(t, { tool: { metadata: 'claude-code' }, output: `console.log(JSON.stringify({
+      type:'result',session_id:'claude-session',is_error:${failed},modelUsage:{'deepseek-v4.1-flash':{}}
+    }));` });
+    const r = f.team();
+    const result = f.run(['run', 'searcher', '--context', r.context, '--task', 'claude', '--prompt', '只读']);
+    assert.equal(result.recorded, !failed);
+    const row = '| claude-session | mock | deepseek-v4.1-flash | 未核实 | searcher（搜索与研究） |\n';
+    assert.equal(f.read(r), teamStart + (failed ? '' : row));
+  }
 });
 
-test('没有启动成功的 CLI 也登记，不把预设 UUID 或面板 ID 冒充原生 ID', t => {
+test('启动失败或没有返回原生 ID 的 CLI 不登记', t => {
   const f = fixture(t, { tool: { headless: ['/nonexistent/hms-agent', '--session-id', '{sessionId}', '{model}', '{effort}', '{prompt}'] } });
   const r = f.team();
   const result = f.run(['run', 'searcher', '--context', r.context, '--task', 'missing', '--prompt', '只读'], 1);
   assert.equal(result.sessionId, null);
-  assert.ok(f.read(r).includes('| 未取得 | mock | 未核实 | 未核实 |'));
+  assert.equal(result.recorded, false);
+  assert.equal(f.read(r), teamStart);
   assert.deepEqual(files(f.project), [f.config, r.record]);
+  const idless = fixture(t, { output: "console.log('ok');" });
+  const team = idless.team();
+  const success = idless.run(['run', 'searcher', '--context', team.context, '--task', 'no-id', '--prompt', '只读']);
+  assert.equal(success.exit, 0);
+  assert.equal(success.recorded, false);
+  assert.equal(idless.read(team), teamStart);
 });
 
 test('原生与直接 CLI 可以补登记在同一表里，不创建另一轮记录', t => {
   const f = fixture(t);
   const r = f.team();
-  f.run(['record', 'add', '--context', r.context, '--tool', 'codex', '--session-id', 'native-session', '--model', 'native-model', '--effort', 'high']);
+  f.run(['record', 'add', '--context', r.context, '--role', 'reviewer', '--tool', 'codex', '--session-id', 'native-session', '--model', 'native-model', '--effort', 'high']);
   assert.equal(f.run(['record', 'add', '--record', r.record, '--tool', 'dsh']).added, false);
-  f.run(['record', 'add', '--mode', 'complex', '--record', r.record, '--tool', 'dsh']);
-  assert.ok(f.read(r).includes('| native-session | codex | native-model | high |'));
-  assert.ok(f.read(r).includes('| 未取得 | dsh | 未核实 | 未核实 |'));
+  const add = ['record', 'add', '--mode', 'complex', '--record', r.record, '--role', 'searcher', '--tool', 'dsh'];
+  assert.equal(f.run(add).added, false);
+  assert.equal(f.run([...add, '--session-id', '未取得']).added, false);
+  assert.equal(f.run([...add, '--session-id', 'dsh-session']).added, true);
+  assert.ok(f.read(r).includes('| native-session | codex | native-model | high | reviewer（审查） |'));
+  assert.ok(f.read(r).includes('| dsh-session | dsh | 未核实 | 未核实 | searcher（搜索与研究） |'));
   assert.deepEqual(files(f.project), [f.config, r.record]);
+});
+
+test('显式面板有 ID 但首条任务没有开始时不登记', t => {
+  const f = fixture(t);
+  const r = f.team(['--confirmed', '同意当前配置']);
+  f.env.HMS_TEST_STALLED = '1';
+  const result = f.run(['spawn', 'frontend', '--context', r.context, '--task', 'draft', '--prompt', '测试'], 1);
+  assert.match(result.stderr, /无法确认首条任务已开始/);
+  assert.equal(f.read(r), teamStart);
+});
+
+test('启动时等待交互的面板在补发确认后登记一次', t => {
+  const f = fixture(t);
+  const r = f.team(['--confirmed', '同意当前配置']);
+  f.env.HMS_TEST_CHILD_STATUS = 'blocked';
+  const pending = f.run(['spawn', 'frontend', '--context', r.context, '--task', 'blocked', '--prompt', '测试']);
+  assert.equal(pending.delivered, false);
+  assert.equal(pending.recorded, false);
+  assert.equal(f.read(r), teamStart);
+
+  delete f.env.HMS_TEST_CHILD_STATUS;
+  const sent = f.run(['prompt', pending.address, '--prompt', pending.prompt]);
+  assert.equal(sent.recorded, true);
+  assert.equal(sent.sessionId, 'visible-session');
+  f.run(['prompt', pending.address, '--prompt', '后续问题']);
+  assert.equal(f.read(r), teamStart + '| visible-session | mock | observed-model | high | frontend（前端实现） |\n');
+});
+
+test('面板已有任务活动但无原生 ID 时返回未登记，表中没有占位行', t => {
+  const f = fixture(t);
+  const r = f.team(['--confirmed', '同意当前配置']);
+  f.env.HMS_TEST_NO_HERDR_ID = '1';
+  const result = f.run(['spawn', 'frontend', '--context', r.context, '--task', 'no-id', '--prompt', '测试']);
+  assert.equal(result.delivered, true);
+  assert.equal(result.recorded, false);
+  assert.equal(result.sessionId, null);
+  assert.equal(f.read(r), teamStart);
+});
+
+test('Herdr 未上报 ID 时，Codex 状态栏与 Claude 面板的原生进程记录可以补齐', t => {
+  const uuid = '01a1f458-da69-7191-95ee-1a17b52f0b33';
+  for (const agent of ['codex', 'claude']) {
+    const f = fixture(t);
+    const r = f.team(['--confirmed', '同意当前配置']);
+    f.env.HMS_TEST_CHILD_AGENT = agent;
+    f.env.HMS_TEST_NO_HERDR_ID = '1';
+    if (agent === 'codex') {
+      f.env.HMS_TEST_CODEX_FOOTER = `  ${uuid} · gpt-test\n  status`;
+    } else {
+      f.env.CLAUDE_CONFIG_DIR = path.join(f.dir, 'claude');
+      f.env.HMS_TEST_CHILD_PID = String(process.pid);
+      const sessions = path.join(f.env.CLAUDE_CONFIG_DIR, 'sessions');
+      fs.mkdirSync(sessions, { recursive: true });
+      fs.writeFileSync(path.join(sessions, `${process.pid}.json`),
+        JSON.stringify({ pid: process.pid, sessionId: uuid, kind: 'interactive' }));
+    }
+    const result = f.run(['spawn', 'frontend', '--context', r.context, '--task', agent, '--prompt', '测试']);
+    assert.equal(result.sessionId, uuid);
+    assert.equal(result.recorded, true);
+    assert.ok(f.read(r).includes(`| ${uuid} | ${agent} | observed-model | high | frontend（前端实现） |`));
+  }
 });
 
 test('派工补发、回报与关闭全部直接走 Herdr，不创建 inbox 或回执', t => {
@@ -290,13 +482,13 @@ test('转团队时首次建表，保留临时配置，重试升级复用本团�
   assert.deepEqual(files(f.project), [f.config]);
   const team = f.run(['record', 'update', ...promote]);
   assert.equal(f.run(['record', 'update', ...promote]).record, team.record);
-  const snap = JSON.parse(Buffer.from(team.context, 'base64url'));
+  const snap = f.ref(team.context);
   assert.equal(team.confirmed, false);
   assert.equal(snap.roleConfig.frontend.effort, 'high');
   assert.deepEqual(snap.previousPanels.frontend, [panel.name]);
   assert.equal(f.run(['record', 'confirm', '--context', team.context, '--on', 'frontend', '--confirmed', '纯前端']).record, team.record);
   assert.match(f.run(['record', 'confirm', '--context', team.context, '--on', 'backend', '--confirmed', '跨端'], 1).stderr, /需要 backend/);
-  assert.equal(f.read(team), `${header}\n| --- | --- | --- | --- |\n| main-session | codex | host-model | max |\n`);
+  assert.equal(f.read(team), teamStart);
   assert.deepEqual(files(f.project), [f.config, team.record]);
 });
 
@@ -307,23 +499,24 @@ test('继续确认和补登旧路径团队表时沿用同一份表', t => {
   const team = f.run(promote);
   const legacy = path.join(path.dirname(f.config), path.basename(team.record));
   fs.renameSync(team.record, legacy);
+  const oldTable = `${legacyHeader}\n| --- | --- | --- | --- |\n| main-session | codex | host-model | max |\n| 未取得 | dsh | 未核实 | 未核实 |\n`;
+  fs.writeFileSync(legacy, oldTable);
 
-  const snap = JSON.parse(Buffer.from(team.context, 'base64url'));
+  const snap = f.ref(team.context);
   const context = Buffer.from(JSON.stringify({ ...snap, record: legacy })).toString('base64url');
   assert.equal(f.run(promote).record, legacy);
   const confirmed = f.run(['record', 'confirm', '--context', context, '--confirmed', '同意当前配置']);
   assert.equal(confirmed.record, legacy);
   f.run(['record', 'add', '--context', confirmed.context, '--tool', 'codex', '--session-id', 'native-session']);
-  f.run(['record', 'add', '--mode', 'complex', '--record', legacy, '--tool', 'dsh']);
-  const record = fs.readFileSync(legacy, 'utf8');
-  assert.match(record, /native-session/);
-  assert.match(record, /\| 未取得 \| dsh \| 未核实 \| 未核实 \|/);
+  assert.equal(f.run(['record', 'add', '--mode', 'complex', '--record', legacy, '--tool', 'dsh']).added, false);
+  assert.equal(fs.readFileSync(legacy, 'utf8'), oldTable + '| native-session | codex | 未核实 | 未核实 |\n');
+  assert.deepEqual(f.run(['ls', '--record', legacy]).sessions.map(row => row[0]), ['main-session', 'native-session']);
   assert.deepEqual(files(f.project), [legacy, f.config]);
 });
 
 test('旧简单 context 停止追加历史表，转团队另起一表', t => {
   const f = fixture(t);
-  const old = JSON.parse(Buffer.from(f.init().context, 'base64url'));
+  const old = f.ref(f.init().context);
   delete old.roundId;
   delete old.title;
   old.schemaVersion = 5;
@@ -357,8 +550,6 @@ test('agy 只登记根 conversation_id，普通文本 CLI 的回答不作为身�
   assert.deepEqual(executionMetadata(printed, '', 'gemini'), { sessionId: 'root' });
   assert.deepEqual(executionMetadata('{"type":"turn_context","payload":{"model":"guess"}}', '', 'goose'), {});
 });
-
-const decodeAddress = addr => JSON.parse(Buffer.from(addr.slice(4), 'base64url').toString('utf8'));
 
 function multiSessionFixture(t, { sessions, roles = {}, env: extraEnv = {} } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hms-multi-'));
@@ -526,7 +717,7 @@ function multiSessionFixture(t, { sessions, roles = {}, env: extraEnv = {} } = {
       ...roles,
     },
   }));
-  const baseEnv = { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH}`, HERDR_ENV: '1' };
+  const baseEnv = { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH}`, HERDR_ENV: '1', XDG_STATE_HOME: path.join(dir, 'state') };
   for (const key of ['HERDR_SESSION', 'HERDR_SOCKET_PATH', 'HERDR_PANE_ID', 'HERDR_TAB_ID', 'HERDR_WORKSPACE_ID', 'CODEX_THREAD_ID', 'CLAUDE_SESSION_ID']) {
     delete baseEnv[key];
   }
@@ -546,7 +737,7 @@ function multiSessionFixture(t, { sessions, roles = {}, env: extraEnv = {} } = {
     fn(s);
     fs.writeFileSync(stateFile, JSON.stringify(s, null, 2));
   };
-  return { dir, project, sockets, run, calls, clearCalls, state, mutateState };
+  return { dir, project, sockets, run, calls, clearCalls, state, mutateState, ref: id => loadRef(baseEnv, id) };
 }
 
 test('手动 Codex 的启动 hook 和 HMS 从实时状态栏核对自身，在共享 app-server 下也只在自己的标签页分屏', t => {
@@ -567,7 +758,7 @@ test('手动 Codex 的启动 hook 和 HMS 从实时状态栏核对自身，在�
   const where = f.run(['where'], { env });
   assert.deepEqual([where.herdrSession, where.herdrSocket, where.workspace, where.tab, where.pane, where.terminalId, where.sessionId],
     ['main', f.sockets.main, 'w1', 'w1:t9', 'w1:p4', 'term-main', mainThread]);
-  assert.equal(decodeAddress(where.address).session, undefined);
+  assert.equal(f.ref(where.address).session, undefined);
   const child = f.run(spawn, { env });
   assert.deepEqual([child.herdrSocket, child.workspace, child.tab], [f.sockets.main, 'w1', 'w1:t9']);
   const split = f.calls().find(c => c.args[0] === 'pane' && c.args[1] === 'split');
@@ -639,7 +830,7 @@ test('双会话共存时按目标 socket 分屏启动 wayfinder，允许跨会�
   assert.equal(mainSpawn.workspace, 'w1');
   assert.equal(mainSpawn.tab, 'w1:t4');
   assert.equal(mainSpawn.pane, 'w1:p99');
-  const mainChildAddr = decodeAddress(mainSpawn.address);
+  const mainChildAddr = f.ref(mainSpawn.address);
   assert.equal(mainChildAddr.socket, f.sockets.main);
   assert.equal(mainChildAddr.pane, 'w1:p99');
   assert.equal(mainChildAddr.terminal, 'term-main-w1:p99');
@@ -673,7 +864,7 @@ test('双会话共存时按目标 socket 分屏启动 wayfinder，允许跨会�
   assert.equal(defSpawn.workspace, 'w1');
   assert.equal(defSpawn.tab, 'w1:t-def');
   assert.equal(defSpawn.pane, 'w1:p99');
-  const defChildAddr = decodeAddress(defSpawn.address);
+  const defChildAddr = f.ref(defSpawn.address);
   assert.equal(defChildAddr.socket, f.sockets.default);
   assert.equal(defChildAddr.terminal, 'term-default-w1:p99');
   const defWrites = f.calls().filter(c => ['split', 'run', 'rename', 'prompt'].includes(c.args[1]));
@@ -718,10 +909,10 @@ test('prompt、notify、close 与再派工全程钉在绑定地址的 socket，�
   const mainDispatchPrompt = f.state().sessions.main.panes.find(p => p.pane_id === 'w1:p99').prompts[0];
   const notifyTo = /notify --to (\S+)/.exec(mainDispatchPrompt)[1];
   const selfParent = /--parent (\S+)/.exec(mainDispatchPrompt)[1];
-  assert.equal(decodeAddress(notifyTo).socket, f.sockets.main);
-  assert.equal(decodeAddress(notifyTo).pane, 'w1:p4');
-  assert.equal(decodeAddress(selfParent).socket, f.sockets.main);
-  assert.equal(decodeAddress(selfParent).pane, 'w1:p99');
+  assert.equal(f.ref(notifyTo).socket, f.sockets.main);
+  assert.equal(f.ref(notifyTo).pane, 'w1:p4');
+  assert.equal(f.ref(selfParent).socket, f.sockets.main);
+  assert.equal(f.ref(selfParent).pane, 'w1:p99');
 
   // prompt 在进程环境指向 default 时仍严格命中 main 的 w1:p99。
   f.clearCalls();
@@ -833,7 +1024,7 @@ test('进程归属、显式会话与原生会话 ID 冲突时均在创建面板�
   assert.equal(where.tab, 'w1:t4');
   assert.equal(where.pane, 'w1:p4');
   assert.equal(where.sessionId, 'main-demo-thread');
-  assert.equal(decodeAddress(where.address).socket, f.sockets.main);
+  assert.equal(f.ref(where.address).socket, f.sockets.main);
 
   f.clearCalls();
   const defAddr = 'hms:' + Buffer.from(JSON.stringify({ socket: f.sockets.default, pane: 'w3:p19' })).toString('base64url');
@@ -892,7 +1083,7 @@ test('强制同标签页分屏，兼容旧 place=tab，拒绝 --place tab，sing
   const crossTabErr = f.run(['spawn', 'pm', '--context', team.context, '--task', 'p3', '--prompt', '跨tab'], { expected: 1, env: mainEnv }).stderr;
   assert.match(crossTabErr, /已在标签页 w1:t-other/);
   const mgmtAddr = /(hms:[A-Za-z0-9_-]+)/.exec(crossTabErr)[1];
-  assert.equal(decodeAddress(mgmtAddr).socket, f.sockets.main);
+  assert.equal(f.ref(mgmtAddr).socket, f.sockets.main);
   assert.ok(!f.calls().some(c => c.args[0] === 'pane' && c.args[1] === 'split'));
 
   // 关闭 main 的 PM，仅在 default 保留同名 singleton；main 应忽略 default 并新建分屏。
@@ -925,6 +1116,6 @@ test('强制同标签页分屏，兼容旧 place=tab，拒绝 --place tab，sing
   f.clearCalls();
   const formerErr = f.run(['spawn', 'pm', '--context', updated.context, '--task', 'p6', '--prompt', '被旧面板拦截'], { expected: 1, env: mainEnv }).stderr;
   assert.match(formerErr, /旧面板/);
-  assert.equal(decodeAddress(/(hms:[A-Za-z0-9_-]+)/.exec(formerErr)[1]).socket, f.sockets.main);
+  assert.equal(f.ref(/(hms:[A-Za-z0-9_-]+)/.exec(formerErr)[1]).socket, f.sockets.main);
   assert.ok(!f.calls().some(c => c.args[0] === 'pane' && c.args[1] === 'split'));
 });

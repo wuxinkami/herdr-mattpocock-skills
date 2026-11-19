@@ -7,13 +7,14 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { commandProblems, configuredRoles, isSet, modeOptions, projectConfigPath, projectRoot, readRouting, toolId } from './routing.mjs';
+import { commandProblems, configuredRoles, configuredTools, isSet, modeOptions, projectConfigPath, projectRoot, readRouting, toolId } from './routing.mjs';
+import { isShortReference, loadReference, saveReference } from './references.mjs';
 
 export const SKILL_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const SETUP_DIR = path.join(path.dirname(SKILL_DIR), 'herdr-setup');
 const HMS = path.join(SKILL_DIR, 'scripts', 'hms.mjs');
 const NAME_RE = /^[a-z][a-z0-9_-]{0,31}$/;
-const CODEX_THREAD_RE = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
+const SESSION_UUID_RE = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
 const DEFAULT_MAIN = ['secretary', 'pm', 'backend'];
 const PANEL_ROLES = new Set(['pm', 'frontend', 'backend', 'wayfinder']);
 const ROLE_USE = {
@@ -23,7 +24,7 @@ const ROLE_USE = {
 };
 const CARRIER = { current: '当前会话', herdr: 'Herdr 面板', auto: '匿名，优先原生', background: '匿名 CLI', native: '宿主原生 subagent' };
 const STATUSES = new Set(['completed', 'blocked', 'failed']);
-const LEDGER_HEAD = '| 会话 ID | Agent 工具 | 实际模型 | 思考等级 |';
+const RECORD_COLUMNS = ['会话 ID', 'Agent 工具', '实际模型', '思考等级', '身份'];
 const LEGACY_RECORD_DIR = '.agents/herdr';
 const RECORD_DIR = `${LEGACY_RECORD_DIR}/session`;
 const BOOL = new Set(['headless', 'force', 'takeover', 'fresh', 'json', 'help']);
@@ -87,7 +88,7 @@ export const configCandidates = project => [projectConfigPath(project)];
 
 // 只有本轮显式点名了项目以外的 CLI，才向 setup 取这一项适配。
 function toolsForOverrides(registered, sets) {
-  const tools = { ...registered };
+  const tools = { ...configuredTools(registered) };
   for (const set of sets) {
     const name = /^[a-z][\w-]*\.tool=(.+)$/.exec(set)?.[1];
     if (!name || name === 'current' || toolId(tools, name)) continue;
@@ -262,9 +263,13 @@ const roleList = s => s ? s.split(',').map(n => n.trim()).filter(Boolean) : [];
 function snapshotFrom(o, project) {
   if (o.context) {
     let snap;
-    try { snap = JSON.parse(Buffer.from(o.context, 'base64url').toString('utf8')); }
-    catch { throw new Error('--context 不是有效的本轮配置'); }
-    if (![3, 4, 5, 6].includes(snap.schemaVersion) || !(snap.roleConfig || snap.roles) || !snap.tools || !snap.project) throw new Error('--context 格式不完整');
+    if (o.context.startsWith('ctx:')) {
+      snap = loadReference(o.context);
+    } else {
+      try { snap = JSON.parse(Buffer.from(o.context, 'base64url').toString('utf8')); }
+      catch { throw new Error('--context 需要本轮配置 ID'); }
+    }
+    if (![3, 4, 5, 6].includes(snap?.schemaVersion) || !(snap.roleConfig || snap.roles) || !snap.tools || !snap.project) throw new Error('--context 格式不完整');
     if (snap.schemaVersion === 3) {
       const migrated = makeSnapshot({ roles: snap.roles, tools: snap.tools }, { mode: snap.mode, host: snap.host, project: snap.project, source: snap.configSource });
       snap = { ...snap, ...migrated, createdAt: snap.createdAt ?? migrated.createdAt, confirmed: snap.confirmed };
@@ -275,6 +280,8 @@ function snapshotFrom(o, project) {
         if (old?.tool === 'current' && old.carrier === 'current' && Object.keys(old).length === 2) delete snap.roleConfig[n];
       }
     }
+    snap.roleConfig = configuredRoles({ roles: snap.roleConfig, tools: snap.tools });
+    snap.tools = configuredTools(snap.tools);
     snap.roles = resolveBindings(snap.roleConfig, snap.tools, snap.host, snap.simpleMain);
     if (snap.mode === 'complex' && o.record && path.resolve(o.record) !== snap.record) throw new Error('同一轮必须使用同一份团队成员表');
     // 旧版用表路径命名单例面板。保留这个键以便交接，简单模式不再读写旧表。
@@ -322,9 +329,9 @@ function snapshotFrom(o, project) {
   return { snap: makeSnapshot(config, { sets: o.set, mode: o.mode, host, off: roleList(o.off), on: roleList(o.on), source: file, project }) };
 }
 
-function encodeContext(snap) {
+function saveContext(snap) {
   const { roles, ...wire } = snap;
-  return Buffer.from(JSON.stringify(wire)).toString('base64url');
+  return saveReference('ctx', wire);
 }
 
 function roleOf(snap, role, carrier, fresh = false) {
@@ -453,7 +460,7 @@ function prepareArgv(snap, r, mode, prompt) {
 
 // ---------- 直接派工 ----------
 
-function dispatchPrompt(snap, { role, task, parent, self, cwd, body }) {
+function dispatchPrompt(snap, { context, role, task, parent, self, cwd, body }) {
   const roleFile = path.join(SKILL_DIR, 'roles', role + '.md');
   const duties = /^[a-z][\w-]*$/.test(role) && fs.existsSync(roleFile)
     ? fs.readFileSync(roleFile, 'utf8').replace(/^#[^\r\n]*\r?\n/, '').trim()
@@ -464,7 +471,8 @@ function dispatchPrompt(snap, { role, task, parent, self, cwd, body }) {
   if (duties) lines.push(duties);
   if (fs.existsSync(projectRules)) lines.push(`仅当任务属于该主仓或其 worktree 且宿主尚未加载时读 ${projectRules}。`);
   if (cwd) lines.push(`本任务工作目录：${cwd}`);
-  lines.push(`如需再派工，用 ${hms}，沿用${snap.mode === 'complex' ? '团队' : '简单'}模式参数 --context ${encodeContext(snap)}`);
+  const id = context.startsWith('ctx:') ? context : saveContext(snap);
+  lines.push(`如需再派工，用 ${hms}，沿用 --context ${id}`);
   if (self) lines.push(`显式再派工加 --parent ${self}`);
   lines.push(`仅在需要调度且当前上下文缺少命令用法时读 ${path.join(SKILL_DIR, 'SKILL.md')}。`);
   if (parent) {
@@ -548,23 +556,28 @@ function waitAgent(socket, target, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     const a = agentInfo(socket, target);
-    if (a && a.agent_status !== 'unknown') return a;
+    if (a?.agent && ['idle', 'done', 'blocked'].includes(a.agent_status)) return a;
     if (Date.now() >= deadline) return null;
     sleep(500);
   }
 }
 
 // 面板地址随派工传递，避免焦点变化或继承的旧环境变量造成错投。
-function panelAddress(socket, agent, managed = false, task) {
-  const binding = { socket, pane: agent.pane_id, terminal: agent.terminal_id, session: agent.agent_session?.value, tool: agent.agent, managed, task };
-  return 'hms:' + Buffer.from(JSON.stringify(binding)).toString('base64url');
+function panelAddress(socket, agent, managed = false, task, pendingMember) {
+  const binding = { socket, pane: agent.pane_id, terminal: agent.terminal_id,
+    session: pendingMember ? undefined : agent.agent_session?.value, tool: agent.agent, managed, task, pendingMember };
+  return saveReference('hms', binding);
 }
 
 function panelRef(target) {
   if (!target.startsWith('hms:')) return { pane: target };
   let ref;
-  try { ref = JSON.parse(Buffer.from(target.slice(4), 'base64url')); }
-  catch { throw new Error('HMS 面板地址格式无效'); }
+  if (isShortReference(target)) {
+    ref = loadReference(target);
+  } else {
+    try { ref = JSON.parse(Buffer.from(target.slice(4), 'base64url')); }
+    catch { throw new Error('HMS 面板地址格式无效'); }
+  }
   if (!ref?.pane || typeof ref.pane !== 'string' ||
       (ref.socket !== undefined && (typeof ref.socket !== 'string' || !path.isAbsolute(ref.socket)))) {
     throw new Error('HMS 面板地址缺少有效的面板 ID 或包含无效的 socket 路径');
@@ -609,6 +622,29 @@ function paneProcessInfo(socket, pane) {
   return herdr(['pane', 'process-info', '--pane', pane], { socket, allowFail: true })?.result?.process_info;
 }
 
+function claudePanelSession(socket, pane) {
+  const profile = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
+  const processes = paneProcessInfo(socket, pane)?.foreground_processes ?? [];
+  const ids = new Set();
+  for (const { pid } of processes) {
+    if (!Number.isSafeInteger(pid) || pid <= 0) continue;
+    try {
+      const session = JSON.parse(fs.readFileSync(path.join(profile, 'sessions', `${pid}.json`), 'utf8'));
+      if (session.pid !== pid || session.kind !== 'interactive' || !SESSION_UUID_RE.test(session.sessionId ?? '')) continue;
+      if (process.platform === 'linux' && session.procStart) {
+        const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+        if (String(session.procStart) !== stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19]) continue;
+      }
+      ids.add(session.sessionId);
+    } catch { /* 该进程未提供可核对的 Claude 会话。 */ }
+  }
+  if (ids.size === 1) return ids.values().next().value;
+}
+
+function codexStatusFields(visible) {
+  return visible?.split(/\r?\n/).map(line => line.trim().split(' · ')) ?? [];
+}
+
 function dstPanelSession(socket, pane) {
   try {
     const info = paneProcessInfo(socket, pane);
@@ -640,7 +676,7 @@ function agentList(socket) {
 }
 
 export function findCodexPanel(threadId) {
-  if (!CODEX_THREAD_RE.test(threadId ?? '')) return null;
+  if (!SESSION_UUID_RE.test(threadId ?? '')) return null;
   const deadline = Date.now() + 5_000;
   const query = (args, socket) => {
     const remaining = deadline - Date.now();
@@ -658,7 +694,7 @@ export function findCodexPanel(threadId) {
     for (const live of agents) {
       if (live.agent !== 'codex') continue;
       const { raw } = query(['pane', 'read', live.pane_id, '--source', 'visible', '--lines', '2'], socket);
-      if (!raw?.split(/\r?\n/).some(line => line.trim().split(' · ').includes(threadId))) continue;
+      if (!codexStatusFields(raw).some(fields => fields.includes(threadId))) continue;
       if (match) {
         throw new Error(`Codex 线程 ${threadId} 匹配多个 Herdr 面板（${match.herdrSession}/${match.live.pane_id}、${name}/${live.pane_id}）`);
       }
@@ -719,7 +755,7 @@ function callerPanel(o, { checkCodex = false } = {}) {
   const selected = selectedSocket(o, ref);
   const inherited = inheritedSocket();
   const threadId = process.env.CODEX_THREAD_ID;
-  const codex = CODEX_THREAD_RE.test(threadId ?? '');
+  const codex = SESSION_UUID_RE.test(threadId ?? '');
   const ancestors = ancestorPids(process.pid, true);
   if (inherited && process.env.HERDR_PANE_ID) {
     const live = herdr(['pane', 'current', '--current'], { socket: inherited, allowFail: true })?.result?.pane;
@@ -769,7 +805,7 @@ function senderPanel(o) {
     }
     return caller;
   }
-  if (CODEX_THREAD_RE.test(process.env.CODEX_THREAD_ID ?? '')) {
+  if (SESSION_UUID_RE.test(process.env.CODEX_THREAD_ID ?? '')) {
     throw new Error('无法确认发起面板：Herdr 可见的 Codex 状态栏未显示本线程的完整 ID。请在当前 Codex 的 /statusline 启用 thread-id 并移到最前，确认面板足够宽，重试 hms where');
   }
   const inherited = process.env.HERDR_SOCKET_PATH ?? process.env.HERDR_SESSION;
@@ -783,13 +819,14 @@ function targetSocket(o, ref) {
 }
 
 function currentHost(o, tools) {
-  const pane = callerPanel(o)?.live;
+  const caller = callerPanel(o);
+  const pane = caller?.live;
   const inferred = process.env.CLAUDE_SESSION_ID ? 'claude-code' : process.env.CODEX_THREAD_ID ? 'codex' : undefined;
   const raw = pane?.agent || o.host || inferred;
   const tool = toolId(tools ?? {}, raw) ?? raw;
   const nativeId = tool === 'codex' ? process.env.CODEX_THREAD_ID : ['claude', 'claude-code'].includes(tool) ? process.env.CLAUDE_SESSION_ID : undefined;
   const meta = agentMetadata(pane);
-  return { tool, observedTool: pane?.agent, sessionId: meta.sessionId || o.sessionId || nativeId,
+  return { tool, observedTool: pane?.agent, sessionId: meta.sessionId || o.sessionId || nativeId || (caller && panelSessionId(caller.socket, pane)),
     model: meta.model || o.hostModel, effort: meta.effort || o.hostEffort };
 }
 
@@ -798,17 +835,21 @@ function currentHost(o, tools) {
 const splitRow = line => line.trim().replace(/^\|/, '').replace(/(?<!\\)\|$/, '').split(/(?<!\\)\|/).map(s => s.trim());
 const makeRow = cells => `| ${cells.map(cell).join(' | ')} |`;
 
-function recordRows(file) {
+function readRecord(file) {
   const lines = fs.readFileSync(file, 'utf8').trim().split(/\r?\n/);
   const header = splitRow(lines[0] ?? '');
   const separator = splitRow(lines[1] ?? '');
-  if (header.length !== 4 || splitRow(LEDGER_HEAD).some((v, i) => header[i] !== v) ||
-      separator.length !== 4 || !separator.every(v => /^:?-{3,}:?$/.test(v)) ||
-      lines.slice(2).some(l => !l.trimStart().startsWith('|') || splitRow(l).length !== 4)) {
-    throw new Error('会话记录必须只有四列表格；旧归档请保留，另起新一轮记录');
+  const width = header.length;
+  if (![4, RECORD_COLUMNS.length].includes(width) || header.some((v, i) => v !== RECORD_COLUMNS[i]) ||
+      separator.length !== width || !separator.every(v => /^:?-{3,}:?$/.test(v)) ||
+      lines.slice(2).some(l => !l.trimStart().startsWith('|') || splitRow(l).length !== width)) {
+    throw new Error('会话记录格式错误，应为 HMS 的会话表格');
   }
-  return lines.slice(2).map(splitRow);
+  const rows = lines.slice(2).map(splitRow).filter(([id]) => validSessionId(id));
+  return { rows, width };
 }
+
+const validSessionId = id => typeof id === 'string' && id.trim() !== '' && id.trim() !== '未取得';
 
 function recordPath(snap, file = snap.record) {
   if (snap.mode !== 'complex') return null;
@@ -819,38 +860,94 @@ function recordPath(snap, file = snap.record) {
   if (!inRecordDir || !/^\d{8}-\d{6}-.+\.md$/.test(path.basename(abs))) {
     throw new Error(`会话表必须是 <项目>/${RECORD_DIR}/<时间戳>-<recap标题>.md，已有会话也可使用原路径`);
   }
-  recordRows(abs);
+  readRecord(abs);
   return abs;
 }
 
-function appendRecord(file, cells) {
-  recordRows(file);
+function standaloneRecord(file) {
+  const dir = path.dirname(path.resolve(file));
+  const project = path.resolve(dir, path.basename(dir) === path.basename(RECORD_DIR) ? '../../..' : '../..');
+  return recordPath({ mode: 'complex', project }, file);
+}
+
+function appendRecord(file, role, tool, meta, { once = false } = {}) {
+  if (!validSessionId(meta.sessionId)) return false;
+  const { width, rows } = readRecord(file);
+  if (once && rows.some(([id]) => id === meta.sessionId)) return true;
+  const cells = sessionCells(role, tool, meta).slice(0, width);
   // 每行用一次 O_APPEND 写入，多个匿名调用并行回报时不会覆盖彼此。
   const fd = fs.openSync(file, 'a');
   try { fs.writeSync(fd, `${makeRow(cells)}\n`); }
   finally { fs.closeSync(fd); }
+  return true;
 }
 
-const sessionCells = (r, meta = {}) => [meta.sessionId || '未取得', meta.observedTool || r.tool, isSet(meta.model) ? meta.model : '未核实', isSet(meta.effort) ? meta.effort : '未核实'];
-function agentMetadata(a) {
-  const sessionId = a?.agent_session?.value;
+function sessionCells(role, tool, meta) {
+  const identity = Object.hasOwn(ROLE_USE, role) ? `${role}（${ROLE_USE[role]}）` : role || '未核实';
+  return [meta.sessionId.trim(), meta.observedTool || tool, isSet(meta.model) ? meta.model : '未核实',
+    isSet(meta.effort) ? meta.effort : '未核实', identity];
+}
+
+function reportedSessionId(agent) {
+  const session = agent?.agent_session;
+  if (!session?.kind || session.kind === 'id') return session?.value;
+}
+
+function agentMetadata(a, sessionId = reportedSessionId(a)) {
   const header = ['dst', 'dsh-tui'].includes(a?.agent) ? dstHeader(sessionId, a.foreground_cwd || a.cwd) : {};
   return { observedTool: a?.agent, sessionId, model: header.model || a?.agent_model?.value, effort: header.effort || a?.agent_effort?.value };
 }
 
-function afterFirstPrompt(socket, agent) {
-  const initial = agent.agent_session?.value;
-  const agy = ['agy', 'gemini', 'antigravity_cli'].includes(agent.agent);
-  let live = agentInfo(socket, agent.pane_id) ?? agent;
-  for (let n = 0; agy && n < 10 && (!live.agent_session?.value || live.agent_session.value === initial); n++) {
-    sleep(500);
-    live = agentInfo(socket, agent.pane_id) ?? live;
+function panelSessionId(socket, agent) {
+  const id = reportedSessionId(agent);
+  if (validSessionId(id)) return id;
+  if (agent.agent === 'codex') {
+    const visible = herdr(['pane', 'read', agent.pane_id, '--source', 'visible', '--lines', '2'], { socket, allowFail: true })?.raw;
+    const ids = new Set(codexStatusFields(visible).map(([first]) => first).filter(field => SESSION_UUID_RE.test(field)));
+    if (ids.size === 1) return ids.values().next().value;
   }
-  // agy 可在空面板上保留前一会话 ID，收到第一条任务才分配新 ID。
-  if (agy && initial && live.agent_session?.value === initial) {
-    return { ...live, agent_session: undefined, agent_model: undefined, agent_effort: undefined };
+  if (['claude', 'claude-code'].includes(agent.agent)) return claudePanelSession(socket, agent.pane_id);
+}
+
+function afterFirstPrompt(socket, initial, waitForId) {
+  const agy = ['agy', 'gemini', 'antigravity_cli'].includes(initial.agent);
+  const ref = { bound: true, pane: initial.pane_id, terminal: initial.terminal_id, tool: initial.agent };
+  const deadline = Date.now() + (waitForId || agy ? 5000 : 0);
+  for (;;) {
+    const agent = agentInfo(socket, initial.pane_id);
+    if (agent?.agent) {
+      checkPanelBinding(socket, ref, agent);
+      const sessionId = panelSessionId(socket, agent);
+      // agy 可在空面板上保留前一会话 ID，收到第一条任务才分配新 ID。
+      if (sessionId && (!agy || sessionId !== reportedSessionId(initial))) return { agent, sessionId };
+    }
+    if (Date.now() >= deadline) return { agent: { ...(agent ?? initial), agent_session: undefined }, sessionId: null };
+    sleep(Math.min(250, deadline - Date.now()));
   }
-  return live;
+}
+
+function memberRecorded(file, sessionId) {
+  return validSessionId(sessionId) && readRecord(file).rows.some(([id]) => id === sessionId);
+}
+
+function submitPanelPrompt(socket, agent, prompt, confirmStart) {
+  if (agent.agent_status === 'blocked') return false;
+  const args = ['agent', 'prompt', agent.pane_id, prompt];
+  if (confirmStart) {
+    if (!['idle', 'done'].includes(agent.agent_status)) throw new Error('面板尚未空闲，无法核对首条任务是否开始');
+    // 从空闲提交时，Herdr 先验证有新活动。若首个回合很快结束，idle/done 也能接住回执。
+    args.push('--wait', '--until', 'working', '--until', 'blocked', '--until', 'idle', '--until', 'done', '--timeout', '8000');
+  }
+  try {
+    herdr(args, { socket, timeout: confirmStart ? 10000 : undefined });
+    return true;
+  } catch (err) {
+    if (err.code === 'agent_blocked') return false;
+    if (confirmStart && ['agent_prompt_stalled', 'timeout', 'ETIMEDOUT'].includes(err.code)) {
+      throw new Error(`无法确认首条任务已开始，请先检查面板中的任务或草稿再决定是否重发（${err.message}）`);
+    }
+    throw err;
+  }
 }
 
 export function executionMetadata(stdout = '', stderr = '', tool) {
@@ -872,11 +969,13 @@ export function executionMetadata(stdout = '', stderr = '', tool) {
     }
     if ((!tool || tool === 'claude-code') && e?.type === 'result') {
       meta.sessionId = e.session_id ?? meta.sessionId;
+      if (e.is_error === true) meta.failed = true;
       const models = Object.keys(e.modelUsage ?? {});
       if (models.length) meta.model = models.join(', ');
     }
     if (tool && tool !== 'codex') continue;
     if (e?.type === 'thread.started') meta.sessionId = e.thread_id;
+    if (e?.type === 'turn.failed') meta.failed = true;
     if (e?.type === 'session_meta') meta.sessionId = e.payload?.id ?? meta.sessionId;
     if (e?.type === 'turn_context') {
       meta.model = e.payload?.model ?? meta.model;
@@ -948,9 +1047,10 @@ function cmdSpawn(o) {
   requireDevelopmentApproval(snap, role);
   if (o.fresh) need(o, 'cwd');
   const r = roleOf(snap, role, 'herdr', o.fresh);
+  const startTimeout = Number(o.startTimeout ?? 60000);
+  if (!Number.isFinite(startTimeout) || startTimeout < 0) throw new Error('--start-timeout 需要非负毫秒数');
   const record = recordPath(snap);
   const { socket, live: parent } = senderPanel(o);
-  const parentAddress = panelAddress(socket, parent, false, o.task);
   const singleton = !o.fresh && singletonRole(snap.mode, role);
   const name = singleton ? singletonName(snap.roundId, role, r) : (o.name ?? `hms-${crypto.randomUUID().slice(0, 8)}`);
   if (!NAME_RE.test(name)) throw new Error('面板名须匹配 [a-z][a-z0-9_-]{0,31}');
@@ -983,6 +1083,7 @@ function cmdSpawn(o) {
     throw new Error(`面板仍在 ${actualCwd || '未知目录'}。本票新实现者用 spawn --fresh --cwd；普通面板请先完成交接再重开`);
   }
   const cwd = reused ? actualCwd : path.resolve(o.cwd ?? process.cwd());
+  const parentAddress = panelAddress(socket, parent, false, o.task);
   let pane = agent?.pane_id;
   if (!reused) {
     const { command } = prepareArgv(snap, r, 'interactive');
@@ -996,36 +1097,40 @@ function cmdSpawn(o) {
       }
       const launch = r.tool === 'dsh' ? shellJoin(['env', 'HERDR_ENV=1', 'HERDR_BIN_PATH=herdr', 'HERDR_PANE_ID=' + pane]) + ' ' + command : command;
       herdr(['pane', 'run', pane, launch], { socket });
-      agent = waitAgent(socket, pane, Number(o.startTimeout ?? 60000));
-      if (!agent) throw new Error('Herdr 尚未识别 agent');
+      agent = waitAgent(socket, pane, startTimeout);
+      if (!agent) throw new Error('Herdr 尚未确认 agent 已就绪');
+      checkPanelBinding(socket, { bound: true, pane, terminal: created.terminal_id }, agent);
       herdr(['agent', 'rename', pane, name], { socket });
     } catch (err) {
-      if (record) appendRecord(record, sessionCells(r, agentMetadata(agent)));
       throw new Error(`${err.message}。已创建面板 ${pane}，派工未送达；管理地址 ${panelAddress(socket, agent ?? created, true)}`);
     }
   }
 
   const report = { role, task: o.task, name, pane, workspace: parent.workspace_id, tab: parent.tab_id, herdrSocket: socket,
     cwd, tool: r.tool, model: r.model, effort: r.effort, record, reused };
+  let sessionId = reused && record ? panelSessionId(socket, agent) : reportedSessionId(agent);
+  let recorded = record ? memberRecorded(record, reused ? sessionId : undefined) : undefined;
+  const pending = record && !recorded ? { file: record, role, tool: r.tool } : undefined;
+  const managementAddress = () => panelAddress(socket, agent, true, undefined, recorded ? undefined : pending);
   try {
     const address = panelAddress(socket, reused ? agent : { ...agent, agent_session: undefined }, true);
-    const prompt = dispatchPrompt(snap, { role, task: o.task, parent: parentAddress, self: address, cwd, body: o.prompt });
-    if (agent.agent_status === 'blocked') {
-      report.delivered = false;
+    const prompt = dispatchPrompt(snap, { context: o.context, role, task: o.task, parent: parentAddress, self: address, cwd, body: o.prompt });
+    report.delivered = submitPanelPrompt(socket, agent, prompt, Boolean(pending));
+    if (!report.delivered) {
       report.prompt = prompt;
       report.note = '面板等待交互，处理后用 prompt 将完整正文补发到 address';
-      if (!reused && r.tool === 'gemini') agent = { ...agent, agent_session: undefined, agent_model: undefined, agent_effort: undefined };
-    } else {
-      herdr(['agent', 'prompt', pane, prompt], { socket });
-      report.delivered = true;
-      if (!reused) agent = afterFirstPrompt(socket, agent);
+      if (!reused && r.tool === 'gemini') sessionId = null;
+    } else if (pending || !reused) {
+      ({ agent, sessionId } = afterFirstPrompt(socket, agent, Boolean(pending)));
+      if (pending) {
+        recorded = appendRecord(record, role, r.tool, agentMetadata(agent, sessionId), { once: true });
+        if (!recorded) report.note = '首条任务已开始，待核实原生会话 ID 后用 record add 补登';
+      }
     }
   } catch (err) {
-    throw new Error(`${err.message}。面板 ${pane} 的管理地址 ${panelAddress(socket, agent, true)}`);
-  } finally {
-    if (record && !reused) appendRecord(record, sessionCells(r, agentMetadata(agent)));
+    throw new Error(`${err.message}。面板 ${pane} 的管理地址 ${managementAddress()}`);
   }
-  out({ ...report, address: panelAddress(socket, agent, true), sessionId: agent.agent_session?.value ?? null });
+  out({ ...report, address: managementAddress(), sessionId: sessionId ?? null, recorded });
 }
 
 function cmdPrompt(o) {
@@ -1035,9 +1140,21 @@ function cmdPrompt(o) {
   const ref = panelRef(target);
   const socket = targetSocket(o, ref);
   const live = panelTarget(socket, ref);
-  if (live.agent_status === 'blocked') throw new Error(`${live.pane_id} 正在等待交互`);
-  herdr(['agent', 'prompt', live.pane_id, o.prompt], { socket });
-  out({ target: live.pane_id, delivered: true });
+  let pending = ref.pendingMember;
+  if (pending) {
+    if (!ref.managed || !ref.socket || !ref.terminal) throw new Error('补发需要派工返回的面板地址');
+    need(pending, 'file', 'role', 'tool');
+    const file = standaloneRecord(pending.file);
+    pending = memberRecorded(file, panelSessionId(socket, live)) ? undefined : { ...pending, file };
+  }
+  if (!submitPanelPrompt(socket, live, o.prompt, Boolean(pending))) throw new Error(`${live.pane_id} 正在等待交互`);
+  const result = { target: live.pane_id, delivered: true };
+  if (pending) {
+    const { agent, sessionId } = afterFirstPrompt(socket, live, true);
+    result.sessionId = sessionId;
+    result.recorded = appendRecord(pending.file, pending.role, pending.tool, agentMetadata(agent, sessionId), { once: true });
+  }
+  out(result);
 }
 
 function cmdNative(o) {
@@ -1052,7 +1169,7 @@ function cmdNative(o) {
   const record = recordPath(snap);
   const cwd = path.resolve(o.cwd ?? process.cwd());
   out({ role, tool: r.tool, model: r.model, effort: r.effort, cwd, record,
-    prompt: dispatchPrompt(snap, { role, task: o.task, cwd, body: o.prompt }) });
+    prompt: dispatchPrompt(snap, { context: o.context, role, task: o.task, cwd, body: o.prompt }) });
 }
 
 function cmdRun(o) {
@@ -1062,7 +1179,7 @@ function cmdRun(o) {
   requireDevelopmentApproval(snap, role);
   const r = roleOf(snap, role, 'background', o.fresh);
   const record = recordPath(snap);
-  const prompt = dispatchPrompt(snap, { role, task: o.task, body: o.prompt });
+  const prompt = dispatchPrompt(snap, { context: o.context, role, task: o.task, body: o.prompt });
   const prepared = prepareArgv(snap, r, 'headless', prompt);
   let argv = prepared.argv;
   if (o.lock) {
@@ -1071,22 +1188,22 @@ function cmdRun(o) {
     if (!fs.statSync(dir).isDirectory()) throw new Error('--lock 必须指向已有共享目录（如 git common dir）');
     argv = ['flock', '--exclusive', '--wait', String(Number(o.lockTimeout ?? 1800000) / 1000), dir, ...argv];
   }
-  let res;
-  let meta = {};
-  try {
-    res = spawnSync(argv[0], argv.slice(1), {
-      cwd: path.resolve(o.cwd ?? process.cwd()), encoding: 'utf8',
-      input: snap.tools[r.tool].promptInput === 'stdin' ? prompt : undefined,
-      maxBuffer: Infinity, timeout: o.timeoutMin ? Number(o.timeoutMin) * 60000 : undefined,
-    });
-    meta = executionMetadata(res.stdout ?? '', res.stderr ?? '', snap.tools[r.tool].metadata ?? r.tool);
-    if (record && r.tool === 'dsh') Object.assign(meta, dstHeader(meta.sessionId, path.resolve(o.cwd ?? process.cwd())));
-  } finally {
-    if (record) appendRecord(record, sessionCells(r, meta));
-  }
+  const cwd = path.resolve(o.cwd ?? process.cwd());
+  const res = spawnSync(argv[0], argv.slice(1), {
+    cwd, encoding: 'utf8',
+    input: snap.tools[r.tool].promptInput === 'stdin' ? prompt : undefined,
+    maxBuffer: Infinity, timeout: o.timeoutMin ? Number(o.timeoutMin) * 60000 : undefined,
+  });
+  const meta = executionMetadata(res.stdout ?? '', res.stderr ?? '', snap.tools[r.tool].metadata ?? r.tool);
   const exit = res.error ? null : res.status;
+  const succeeded = exit === 0 && !meta.failed;
+  let recorded;
+  if (record) {
+    if (succeeded && r.tool === 'dsh') Object.assign(meta, dstHeader(meta.sessionId, cwd));
+    recorded = succeeded && appendRecord(record, role, r.tool, meta);
+  }
   out({ role, task: o.task, tool: r.tool, model: r.model, effort: r.effort, sessionId: meta.sessionId ?? null,
-    exit, signal: res.signal ?? null, error: res.error?.message ?? null, stdout: res.stdout ?? '', stderr: res.stderr ?? '', record });
+    exit, signal: res.signal ?? null, error: res.error?.message ?? null, stdout: res.stdout ?? '', stderr: res.stderr ?? '', record, recorded });
   process.exitCode = exit ?? 1;
 }
 
@@ -1143,7 +1260,7 @@ function cmdLs(o) {
   requireHerdr();
   need(o, 'record');
   const socket = selectedSocket(o) ?? inheritedSocket();
-  out({ sessions: recordRows(path.resolve(o.record)), live: herdr(['agent', 'list'], { socket }) });
+  out({ sessions: readRecord(path.resolve(o.record)).rows, live: herdr(['agent', 'list'], { socket }) });
 }
 
 function developmentProblems(snap) {
@@ -1163,6 +1280,11 @@ function confirmSnap(snap, note) {
   return { ...snap, confirmed: true, confirmedAt: nowIso(), confirmation: oneLine(note) };
 }
 
+function roundReference(snap, title, record) {
+  const roundId = snap.roundId ?? record ?? crypto.randomUUID();
+  return { record, context: saveContext({ ...snap, roundId, title, record }) };
+}
+
 function createTeamRecord(snap, title, promote) {
   const dir = path.join(snap.project, RECORD_DIR);
   // 同一个简单 context 重试升级时，仍指向它自己的团队表。
@@ -1170,20 +1292,25 @@ function createTeamRecord(snap, title, promote) {
   const base = `${stamp(new Date(snap.createdAt))}-${title}${suffix}`;
   if (promote && !fs.existsSync(path.join(dir, `${base}.md`))) {
     const legacy = path.join(snap.project, LEGACY_RECORD_DIR, `${base}.md`);
-    if (fs.existsSync(legacy)) return recordPath(snap, legacy);
+    if (fs.existsSync(legacy)) return roundReference(snap, title, recordPath(snap, legacy));
   }
   fs.mkdirSync(dir, { recursive: true });
-  const cells = sessionCells({ tool: snap.host.tool || '未核实' }, snap.host);
   const template = fs.readFileSync(path.join(SKILL_DIR, 'templates/session-log.md'), 'utf8');
+  const host = validSessionId(snap.host.sessionId) ? makeRow(sessionCells('secretary', snap.host.tool || '未核实', snap.host)) + '\n' : '';
   const draft = path.join(dir, `.${crypto.randomUUID()}.tmp`);
   try {
-    fs.writeFileSync(draft, `${template.trimEnd()}\n${makeRow(cells)}\n`, { flag: 'wx' });
+    fs.writeFileSync(draft, `${template.trimEnd()}\n${host}`, { flag: 'wx' });
     for (let n = 1; ; n++) {
       const record = path.join(dir, `${base}${n === 1 ? '' : `-${n}`}.md`);
-      try { fs.linkSync(draft, record); return record; }
+      if (fs.existsSync(record)) {
+        if (promote) return roundReference(snap, title, recordPath(snap, record));
+        continue;
+      }
+      const reference = roundReference(snap, title, record);
+      try { fs.linkSync(draft, record); return reference; }
       catch (e) {
         if (e.code !== 'EEXIST') throw e;
-        if (promote) return recordPath(snap, record);
+        if (promote) return roundReference(snap, title, recordPath(snap, record));
       }
     }
   } finally {
@@ -1196,32 +1323,27 @@ function initRound(o) {
   if ((initial.mode === 'complex' && initial.confirmed && changed?.length) || o._[1] === 'confirm') need(o, 'confirmed');
   const snap = o.confirmed ? confirmSnap(initial, o.confirmed) : initial;
   const title = sanitizeTitle(snap.title ?? o.title ?? o.recap ?? '团队');
-  let record = null;
-  if (snap.mode === 'complex') {
-    const existing = promote ? null : snap.record ?? o.record;
-    record = existing ? recordPath(snap, existing) : createTeamRecord(snap, title, promote);
-  }
-  const roundId = snap.roundId ?? record ?? crypto.randomUUID();
-  out({ record, context: encodeContext({ ...snap, roundId, title, record }), confirmed: snap.confirmed, changed });
+  const existing = snap.mode === 'complex' && !promote ? snap.record ?? o.record : null;
+  const reference = snap.mode === 'complex' && !existing
+    ? createTeamRecord(snap, title, promote)
+    : roundReference(snap, title, existing ? recordPath(snap, existing) : null);
+  out({ ...reference, confirmed: snap.confirmed, changed });
 }
 
 function recordAdd(o) {
   need(o, 'tool');
   // 表路径本身无法区分历史简单模式和团队。脱离 context 补登须明示团队模式。
-  let snap;
+  let record;
   if (o.context) {
-    ({ snap } = snapshotFrom(o, projectRoot(o)));
-  } else {
-    if (o.mode !== 'complex') return out({ record: null, added: false });
+    const { snap } = snapshotFrom(o, projectRoot(o));
+    record = recordPath(snap, o.record);
+  } else if (o.mode === 'complex') {
     need(o, 'record');
-    const dir = path.dirname(path.resolve(o.record));
-    const relativeProject = path.basename(dir) === path.basename(RECORD_DIR) ? '../../..' : '../..';
-    snap = { mode: 'complex', project: path.resolve(dir, relativeProject) };
+    record = standaloneRecord(o.record);
   }
-  const record = recordPath(snap, o.record);
   if (!record) return out({ record: null, added: false });
-  appendRecord(record, sessionCells({ tool: o.tool }, { sessionId: o.sessionId, model: o.model, effort: o.effort }));
-  out({ record, added: true });
+  const added = appendRecord(record, o.role, o.tool, { sessionId: o.sessionId, model: o.model, effort: o.effort });
+  out({ record, added });
 }
 
 function cmdRecord(o) {
@@ -1238,10 +1360,10 @@ const HELP = `hms — Herdr 角色调度
   resolve [--mode simple|complex] [--host T --host-model M --host-effort E] [--set role.field=value] [--on a,b] [--off a,b]
   resolve --context C --set role.model=M                 仅展示受影响的身份
   init [--title 简称] [同 resolve 的配置] [--session-id ID] [--confirmed 用户答复]
-                                                        返回本轮 context，团队模式在 ${RECORD_DIR}/ 建成员表
+                                                        返回本轮短 ID，团队模式在 ${RECORD_DIR}/ 建成员表
   record confirm --context C --confirmed 用户答复         确认本轮配置，返回新 context
   record update --context C [--mode complex] [--set ...] [--on a,b] [--off a,b] [--confirmed 用户答复]
-  record add --context C --tool T [--session-id ID --model M --effort E]
+  record add --context C --role ROLE --tool T --session-id ID [--model M --effort E]
   where [--herdr-session NAME] [--parent PANE或地址] [--session-id ID]
   spawn ROLE --context C --task ID --prompt 正文 [--herdr-session NAME] [--parent PANE或地址] [--session-id ID] [--fresh --cwd DIR]
   prompt PANE或地址 --prompt 正文 [--herdr-session NAME]
@@ -1252,6 +1374,7 @@ const HELP = `hms — Herdr 角色调度
   ls --record 表路径 [--herdr-session NAME]
   argv ROLE [--context C] [--headless] [--fresh]          预览实际工具命令
 
+--context 使用本轮 ctx:… 短 ID，--parent / --to 和面板管理使用 hms:… 短 ID。
 where 核对当前发起面板，spawn 重新核对并在同一标签页分屏。--herdr-session 指定 Herdr 会话名，--session-id 指 agent 原生会话 ID。
 --fresh 用项目的 frontend 或 backend 配置，在本票 worktree 开显式新面板。--project DIR 指定主项目。`;
 

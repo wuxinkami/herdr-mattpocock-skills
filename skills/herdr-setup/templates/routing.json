@@ -3,12 +3,10 @@
   "active": false,
   "tools": {
     "codex": {
-      "preferredExecutables": {"codex":"codexxx"},
       "interactive": ["codex","{model}","{effort}"],
       "headless": ["codex","exec","--json","--ephemeral","--skip-git-repo-check","--sandbox","workspace-write","{model}","{effort}","{prompt}"],
       "model": ["--model","{value}"],
       "effort": ["-c","model_reasoning_effort=\"{value}\""],
-      "aliases": ["codexxx"],
       "source": "https://developers.openai.com/codex/cli/reference"
     },
     "claude-code": {
