@@ -17,7 +17,7 @@ disable-model-invocation: true
 **团队模式**。用户说「团队」「多 agent」，或本轮 HMS 使用 wayfinder 时，当前 agent 任秘书。开发前展示本轮所需角色（含匿名角色）的 CLI、模型和等级，确认后开唯一 PM 按票派工。纯前端票由前端主责，含后端的票由后端主责，跨端在本票 worktree 依序交接。下例只派前端。
 
 ```bash
-team_opts=(--mode complex --on pm,frontend --off wayfinder,backend,searcher,reviewer,designer,merger)
+team_opts=(--mode complex --on pm,frontend --off wayfinder,spec-writer,backend,searcher,reviewer,designer,merger)
 hms resolve "${team_opts[@]}"
 # 用户确认后，沿用刚展示的选项
 context=$(hms init "${team_opts[@]}" --title "$title" --confirmed "$reply" | jq -er '.context')
@@ -28,7 +28,13 @@ hms spawn pm --context "$context" --task "$task" --prompt "$prompt"
 
 `--on` 标记必需角色，`--off` 停用本轮不用的角色。缺少路由时用 `$herdr-setup` 补项目默认值，或用 `--set` 临时指定。已知宿主配置可传 `--host "$tool" --host-model "$model" --host-effort "$effort"`。
 
-任务使用 Matt 时，由对应技能决定步骤、独立性和完成条件。只建 map 时用 `hms init --mode complex --title "$title"` 加所需角色，派 searcher 做 research，建完即停。用户要求串行推进时，秘书逐票开 wayfinder，传技能、map 和 ticket。进入开发才沿用该 context 预览并确认。审查用 reviewer，独立方案用 designer，流程要求独立合并时由 PM 在用户授权内派 merger。
+任务使用 Matt 时，由对应技能决定步骤、独立性和完成条件。只建 map 时用 `hms init --mode complex --title "$title"` 加所需角色，派 searcher 做 research，建完即停。用户要求串行推进时，秘书逐票开 wayfinder，传技能、map 和 ticket。审查用 reviewer，独立方案用 designer，流程要求独立合并时由 PM 在用户授权内派 merger。
+
+## 从决策到开发工单
+
+1. 用户要求把已定决策转成规格和开发工单时，秘书用 `--on spec-writer` 预览并更新本轮配置。项目路由缺这一行时用 `$herdr-setup` 补填，临时选择用 `--set`。取新 `context`，用 `hms spawn spec-writer --context "$context" --task "$task" --prompt "$prompt"` 开面板。正文附 `to-spec`、`to-tickets` 的技能引用、已确认的决策和相关原型。有 Wayfinder map 时附 map 链接，规格编写者按链接读取决策票结论。
+2. `spec-writer` 在同一面板依序完成 `to-spec` 和 `to-tickets`，当面和用户核对测试切入点、工单拆分及阻塞关系。两项产物发布后，用 `notify` 向秘书回报规格和开发工单入口，可用 Issue 链接或本地路径。
+3. 秘书收到回报后，按本轮开发配置确认，用 `spawn pm` 将两个引用和 `implement-spec` 技能交给 PM。PM 按工单依赖推进实现。
 
 ## 派工与回报
 
@@ -60,7 +66,7 @@ hms spawn wayfinder --context "$context" --task "$grilling_ticket" --prompt "$gr
 - `spawn` 在发起面板所属的 Herdr 会话、工作区和标签页分屏。返回的 `address` 是绑定 socket 和面板的 `hms:…` 短 ID，用于续发或关闭。`delivered: false` 时先处理面板等待项，再用 `prompt` 补发返回的完整正文。再派工和回报照抄收到的 `--parent` 和 `--to` 短 ID。票级新实现者加 `--fresh --cwd "$worktree"`，沿用本轮 context。查主项目配置加 `--project "$project"`。
 - 团队显式成员在 Herdr 观察到首条任务活动并取得原生会话 ID 后登记，处理等待项后用原地址补发同样适用。首条任务确认超时时，先检查面板是否已收到任务或留下草稿。任务已开始且返回 `recorded: false` 时，核实 ID 后用 `record add --run "$run"` 补登。
 - 用任务正文附带的 `notify` 回报，状态可填 `completed`、`blocked`、`failed`。团队回报先入库，再投递给发起者。发起者等待审批时最多等一分钟，超时可使用原命令重发。
-- 等发送方结束回合后关闭。团队 PM 关自己的成员，秘书关 PM 和逐票 wayfinder。借用面板保留，明确移交管理时用 `hms close "$pane" --takeover`。
+- 等发送方结束回合后关闭，由各发起者关闭自己调度的面板。借用面板保留，明确移交管理时用 `hms close "$pane" --takeover`。
 
 ## 匿名派工
 

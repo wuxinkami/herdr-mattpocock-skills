@@ -17,9 +17,9 @@ const HMS = path.join(SKILL_DIR, 'scripts', 'hms.mjs');
 const NAME_RE = /^[a-z][a-z0-9_-]{0,31}$/;
 const SESSION_UUID_RE = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
 const DEFAULT_MAIN = ['secretary', 'pm', 'backend'];
-const PANEL_ROLES = new Set(['pm', 'frontend', 'backend', 'wayfinder']);
+const PANEL_ROLES = new Set(['pm', 'frontend', 'backend', 'wayfinder', 'spec-writer']);
 const ROLE_USE = {
-  secretary: '用户沟通与建图', pm: '团队派工与收尾', wayfinder: '一张决策票',
+  secretary: '用户沟通与建图', pm: '团队派工与收尾', wayfinder: '一张决策票', 'spec-writer': '规格与工单',
   frontend: '前端实现', backend: '后端实现', searcher: '搜索与研究',
   reviewer: '审查', designer: '独立方案', merger: '授权合并',
 };

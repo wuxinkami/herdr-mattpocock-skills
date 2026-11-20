@@ -12,6 +12,7 @@ import { stateFile } from '../skills/herdr-mattpocock-skills/scripts/store.mjs';
 
 const skillsDir = fileURLToPath(new URL('../skills/', import.meta.url));
 const hms = path.join(skillsDir, 'herdr-mattpocock-skills/scripts/hms.mjs');
+const setup = path.join(skillsDir, 'herdr-setup/scripts/setup.mjs');
 const legacyHeader = '| 会话 ID | Agent 工具 | 实际模型 | 思考等级 |';
 const header = '| 会话 ID | Agent 工具 | 实际模型 | 思考等级 | 身份 |';
 const secretaryRow = '| main-session | codex | host-model | max | secretary（用户沟通与建图） |';
@@ -169,7 +170,7 @@ test('本地状态无法写入时，团队初始化不留下无法引用的会�
   assert.deepEqual(files(f.project), [f.config]);
 });
 
-test('Codex 的旧路由与旧 context 均启动 codex，保存路由时清理旧可执行名', t => {
+test('Codex 的旧路由与旧 context 均启动 codex，重复 setup 保留保存的路由', t => {
   const f = fixture(t);
   const wrapper = 'project-codex-wrapper';
   const bin = path.join(f.dir, 'bin');
@@ -209,12 +210,65 @@ test('Codex 的旧路由与旧 context 均启动 codex，保存路由时清理�
   const result = f.run(['run', 'searcher', '--context', legacyContext, '--task', '回归测试', '--prompt', '测试']);
   assert.equal(result.sessionId, 'codex-test-session');
 
-  const setup = path.join(skillsDir, 'herdr-setup/scripts/setup.mjs');
+  const previous = fs.readFileSync(f.config, 'utf8');
   const saved = spawnSync(process.execPath, [setup, 'apply', '--project', f.project], {
     input: '{"roles":{}}', encoding: 'utf8',
   });
   assert.equal(saved.status, 0, saved.stderr);
-  assert.ok(!fs.readFileSync(f.config, 'utf8').includes(wrapper));
+  assert.equal(fs.readFileSync(f.config, 'utf8'), previous);
+});
+
+test('setup 回显已有路由，补填缺失身份时保留未激活配置及闲置适配', t => {
+  const f = fixture(t);
+  const previous = JSON.parse(fs.readFileSync(f.config, 'utf8'));
+  previous.active = false;
+  previous.schemaVersion = 5;
+  previous.tools.unused = { interactive: ['custom-cli'], options: { headless: { env: { PROFILE: 'custom' } } } };
+  previous.roles.reviewer = { inherit: 'searcher', carrier: 'auto', enabled: false };
+  fs.writeFileSync(f.config, JSON.stringify(previous));
+
+  const form = spawnSync(process.execPath, [setup, 'form', '--project', f.project], { encoding: 'utf8' });
+  assert.equal(form.status, 0, form.stderr);
+  assert.ok(form.stdout.includes('| frontend | mock | requested-alias | max |'));
+  assert.ok(form.stdout.includes('| reviewer（停用） | 同 searcher | 同 searcher | 同 searcher |'));
+  assert.ok(form.stdout.includes('| spec-writer |  |  |  |'));
+  assert.deepEqual(JSON.parse(fs.readFileSync(f.config, 'utf8')), previous);
+
+  const input = JSON.stringify({ roles: { 'spec-writer': { tool: 'mock', model: 'spec-model' } } });
+  const apply = () => {
+    const result = spawnSync(process.execPath, [setup, 'apply', '--project', f.project], { input, encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+  };
+  apply();
+  assert.deepEqual(JSON.parse(fs.readFileSync(f.config, 'utf8')), {
+    ...previous, active: true, roles: {
+      ...previous.roles,
+      'spec-writer': { tool: 'mock', model: 'spec-model', effort: 'high', carrier: 'herdr' },
+    },
+  });
+  const time = new Date('2000-01-01T00:00:00Z');
+  fs.utimesSync(f.config, time, time);
+  apply();
+  assert.equal(fs.statSync(f.config).mtimeMs, time.valueOf());
+  assert.deepEqual(files(f.project), [f.config]);
+});
+
+test('从路由模板启用一个身份时，其余空行可保留待填', t => {
+  const f = fixture(t);
+  const template = fs.readFileSync(path.join(skillsDir, 'herdr-setup/templates/routing.json'), 'utf8');
+  fs.writeFileSync(f.config, template);
+  const result = spawnSync(process.execPath, [setup, 'apply', '--project', f.project], {
+    input: JSON.stringify({ roles: { frontend: { tool: 'claude', model: 'frontend-model' } } }), encoding: 'utf8',
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const { roles, tools } = JSON.parse(template);
+  const config = JSON.parse(fs.readFileSync(f.config, 'utf8'));
+  assert.deepEqual(config.roles['spec-writer'], roles['spec-writer']);
+  assert.deepEqual(config.tools, tools);
+  assert.equal(f.run(['config']).active, true);
+  const { context } = f.init();
+  assert.equal(f.run(['argv', 'frontend', '--context', context]).model, 'frontend-model');
+  assert.equal(Object.hasOwn(f.ref(context).roleConfig, 'spec-writer'), false);
 });
 
 test('显式面板通过 Herdr 直接收到原文并登记原生 ID，不用派工文件', t => {
@@ -763,6 +817,58 @@ function multiSessionFixture(t, { sessions, roles = {}, env: extraEnv = {} } = {
   };
   return { dir, project, sockets, run, calls, clearCalls, state, mutateState, ref: id => loadRef(baseEnv, id) };
 }
+
+test('同轮补配 spec-writer，规格与工单的回报可交给 PM', t => {
+  const secretary = { pane_id: 'w1:p4', workspace_id: 'w1', tab_id: 'w1:t4', terminal_id: 'term-secretary',
+    agent: 'codex', agent_status: 'idle', agent_session: { value: 'secretary-thread' }, matchCaller: true };
+  const specModel = 'spec-model';
+  const f = multiSessionFixture(t, { sessions: { main: {
+    panes: [secretary], launches: { claude: { agent: 'claude', model: specModel, effort: 'high' } },
+  } } });
+  const env = { CODEX_THREAD_ID: 'secretary-thread', HERDR_SOCKET_PATH: f.sockets.main, HERDR_PANE_ID: secretary.pane_id };
+  const team = f.run(['init', '--mode', 'complex', '--title', '规格与工单', '--set', 'pm.effort=high'], { env });
+  const preview = ['resolve', '--context', team.context, '--on', 'spec-writer', '--json'];
+  f.run(preview, { expected: 2, env });
+  const temporary = f.run([...preview, '--set', 'spec-writer.tool=mock', '--set', 'spec-writer.model=temporary-model'], { env });
+  assert.equal(temporary.roles['spec-writer'].carrier, 'herdr');
+
+  const applied = spawnSync(process.execPath, [setup, 'apply', '--project', f.project], {
+    input: JSON.stringify({ roles: { 'spec-writer': { tool: 'claude', model: specModel } } }), encoding: 'utf8',
+  });
+  assert.equal(applied.status, 0, applied.stderr);
+  const updated = f.run(['record', 'update', '--context', team.context, '--on', 'spec-writer'], { env });
+  assert.equal(updated.round, team.round);
+  assert.equal(updated.record, team.record);
+  assert.notEqual(updated.context, team.context);
+  assert.equal(f.ref(updated.context).roleConfig.pm.effort, 'high');
+  assert.equal(Object.hasOwn(f.ref(team.context).roleConfig, 'spec-writer'), false);
+
+  const task = 'spec-and-tickets';
+  const body = '读取 map.md 中已确认的决策和 prototype.html';
+  const worker = f.run(['spawn', 'spec-writer', '--context', updated.context, '--task', task, '--prompt', body], { env });
+  assert.equal(worker.tool, 'claude-code');
+  assert.equal(worker.model, specModel);
+  assert.equal(worker.recorded, true);
+  const prompt = f.state().sessions.main.panes.find(p => p.pane_id === worker.pane).prompts[0];
+  assert.match(prompt, /`to-spec`[\s\S]*`to-tickets`/);
+  assert.ok(prompt.endsWith(body));
+  assert.ok(prompt.includes(`--context ${updated.context}`));
+  assert.ok(fs.readFileSync(team.record, 'utf8').includes(`| ${worker.sessionId} | claude | ${specModel} | high | spec-writer（规格与工单） |`));
+  const reply = /notify --to (hms:[A-Za-z0-9_-]+)/.exec(prompt)[1];
+  const refs = '规格 .scratch/feature/spec.md，工单 .scratch/feature/issues/';
+  const notified = f.run(['notify', '--to', reply, '--task', task, '--role', 'spec-writer', '--status', 'completed', '--summary', refs], { env });
+  assert.equal(notified.to, secretary.pane_id);
+  const result = f.run(['ls', '--round', team.round, '--run', worker.run], { env });
+  assert.equal(result.status, 'completed');
+  assert.equal(result.summary, refs);
+
+  const confirmed = f.run(['record', 'confirm', '--context', updated.context, '--confirmed', '同意开发配置'], { env });
+  const pm = f.run(['spawn', 'pm', '--context', confirmed.context, '--task', 'implement', '--prompt', `执行 implement-spec。${result.summary}`], { env });
+  assert.notEqual(pm.pane, worker.pane);
+  assert.equal(pm.record, worker.record);
+  const pmPrompt = f.state().sessions.main.panes.find(p => p.pane_id === pm.pane).prompts[0];
+  assert.ok(pmPrompt.endsWith(`执行 implement-spec。${refs}`));
+});
 
 test('同轮页面原型借用前端配置，普通 grilling 仍用 Wayfinder 配置', t => {
   const wayfinder = { tool: 'codex', model: 'test-grilling-model', effort: 'high', carrier: 'herdr' };

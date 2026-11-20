@@ -10,6 +10,7 @@ export function projectRoot({ project } = {}) {
 
 export const projectConfigPath = project => path.join(project, '.agents', 'herdr', 'routing.json');
 export const isSet = v => typeof v === 'string' && v.trim() !== '' && !['default', 'inherit', 'current'].includes(v);
+export const isRolePlaceholder = role => role?.tool === '' && role.model === '' && !role.inherit && role.enabled === undefined;
 
 export function readRouting(file) {
   let config;
@@ -19,15 +20,17 @@ export function readRouting(file) {
     throw new Error(`无法读取 ${file}：${e.message}`);
   }
   if (!config || typeof config !== 'object' || Array.isArray(config)) throw new Error(`${file} 需要 JSON 对象`);
-  const bindings = Object.entries(config.roles ?? {}).filter(([name, role]) => name !== 'secretary' && role?.enabled !== false);
+  const bindings = Object.entries(config.roles ?? {}).filter(([name, role]) =>
+    name !== 'secretary' && role?.enabled !== false && !isRolePlaceholder(role));
   const filled = bindings.length > 0 && bindings.every(([, role]) =>
     role && (role.inherit || (role.tool && typeof role.model === 'string' && role.model.trim())));
   return { file, config, active: config.active === true && Boolean(config.tools && filled) };
 }
 
 // 迁移旧身份时，保留仍在用的身份所继承的项目路由。
-export function configuredRoles(config) {
-  const roles = structuredClone(config.roles ?? {});
+export function configuredRoles(config, { includePlaceholders = false } = {}) {
+  const entries = Object.entries(config.roles ?? {}).filter(([, role]) => includePlaceholders || !isRolePlaceholder(role));
+  const roles = structuredClone(Object.fromEntries(entries));
   if (roles.griller) roles.wayfinder ??= roles.griller;
   for (const role of Object.values(roles)) {
     if (role.inherit === 'griller') role.inherit = 'wayfinder';
