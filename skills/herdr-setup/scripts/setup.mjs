@@ -2,7 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { isDeepStrictEqual, parseArgs } from 'node:util';
-import { commandProblems, configuredRoles, configuredTools, isRolePlaceholder, projectRoot, projectConfigPath, readRouting, toolId } from '../../herdr-mattpocock-skills/scripts/routing.mjs';
+import { commandProblems, configuredRoles, configuredTools, currentRole, isRolePlaceholder, projectRoot, projectConfigPath, readRouting, roleSkills, toolId } from '../../herdr-mattpocock-skills/scripts/routing.mjs';
 
 const template = JSON.parse(fs.readFileSync(new URL('../templates/routing.json', import.meta.url), 'utf8'));
 const object = v => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -13,17 +13,17 @@ function adapter(catalog, id) {
   return command;
 }
 
-function form(config = {}) {
+function form(config = {}, selected = []) {
   const previous = configuredRoles(config, { includePlaceholders: true });
-  const names = new Set([...Object.keys(template.roles), ...Object.keys(previous)]);
-  const rows = ['| 身份 | 项目 CLI | 模型 | 默认思考等级 |', '| --- | --- | --- | --- |'];
+  const names = new Set(selected.length ? selected.map(currentRole) : [...Object.keys(template.roles), ...Object.keys(previous)]);
+  const rows = ['| 身份 | 项目 CLI | 模型 | 默认思考等级 | 项目默认技能 |', '| --- | --- | --- | --- | --- |'];
   for (const name of names) {
-    if (name === 'secretary' && !Object.hasOwn(previous, name)) continue;
-    const role = previous[name] ?? {};
+    if (name === 'secretary' && !selected.length && !Object.hasOwn(previous, name)) continue;
+    const role = previous[name] ?? (name === 'secretary' ? template.roles.secretary : {});
     const label = role.enabled === false ? `${name}（停用）` : name;
     const inherited = role.inherit ? `同 ${role.inherit}` : '';
     const effort = isRolePlaceholder(role) ? '' : role.effort || inherited;
-    rows.push(`| ${cell(label)} | ${cell(role.tool || inherited)} | ${cell(role.model || inherited)} | ${cell(effort)} |`);
+    rows.push(`| ${cell(label)} | ${cell(role.tool || inherited)} | ${cell(role.model || inherited)} | ${cell(effort)} | ${cell(role.skills?.join(', '))} |`);
   }
   return rows.join('\n');
 }
@@ -73,16 +73,22 @@ function activate(saved = { schemaVersion: template.schemaVersion }, answers) {
   const oldRoles = configuredRoles(saved);
   const roles = { ...saved.roles };
   roles.secretary ??= { ...template.roles.secretary, model: 'inherit' };
-  for (const [name, choice] of Object.entries(answers.roles)) {
-    if (name === 'secretary') throw new Error('秘书沿用当前会话，只填写需要委派的身份');
+  for (const [inputName, choice] of Object.entries(answers.roles)) {
+    const name = currentRole(inputName);
+    const skillsOnly = object(choice) && choice.skills !== undefined && Object.keys(choice).length === 1;
+    if (name === 'secretary' && !skillsOnly) throw new Error('秘书沿用当前会话，支持配置 skills');
     if (!/^[a-z][\w-]*$/.test(name) || ['griller', 'checker', 'worker', 'tester', 'constructor'].includes(name)) throw new Error(`无效身份 ${name}`);
     if (choice === null) {
-      delete roles[name];
-      if (name === 'wayfinder') delete roles.griller;
+      for (const key of Object.keys(roles)) if (currentRole(key) === name) delete roles[key];
       continue;
     }
     if (!object(choice)) throw new Error(`${name} 需要 tool、model 和可选的 effort`);
-    const old = oldRoles[name] ?? roles[name] ?? {};
+    const old = oldRoles[name] ?? roles[name] ?? template.roles[name] ?? { tool: '', model: '', carrier: 'auto' };
+    const skills = choice.skills === undefined ? {} : { skills: roleSkills(choice.skills) };
+    if (skillsOnly) {
+      roles[name] = { ...old, ...skills };
+      continue;
+    }
     const requested = String(choice.tool ?? old.tool ?? '').trim();
     const tool = toolId(catalog, requested);
     if (!tool) throw new Error(`${name} 的 CLI「${requested}」没有适配。运行 tools 查看名称，或在输入的 tools 中提供适配。`);
@@ -91,7 +97,7 @@ function activate(saved = { schemaVersion: template.schemaVersion }, answers) {
     if (!model || ['inherit', 'current'].includes(model)) throw new Error(`请填写 ${name} 使用的模型，或明确选 default`);
     const effort = String(choice.effort ?? (sameTool ? old.effort : undefined) ?? '').trim() || 'high';
     if (['inherit', 'current'].includes(effort)) throw new Error(`请填写 ${name} 的思考等级，或选 default`);
-    const role = { carrier: 'auto', ...template.roles[name], ...old, tool, model, effort };
+    const role = { carrier: 'auto', ...template.roles[name], ...old, ...skills, tool, model, effort };
     delete role.inherit;
     delete role.enabled;
     roles[name] = role;
@@ -105,8 +111,11 @@ function activate(saved = { schemaVersion: template.schemaVersion }, answers) {
   const config = { ...saved, active: true, tools, roles };
   // 旧适配在读取时兼容，补填身份时保留项目保存的命令。
   const commands = (config.schemaVersion ?? 0) < template.schemaVersion ? projectCatalog(config) : configuredTools(tools);
-  const enabled = Object.entries(bindings).filter(([name, r]) => name !== 'secretary' && r.enabled !== false);
-  if (!enabled.length) throw new Error('请至少填写一行项目使用的 CLI 和模型');
+  const enabled = Object.entries(bindings).filter(([name, r]) => name !== 'secretary' && r.enabled !== false && !isRolePlaceholder(r));
+  if (!enabled.length) {
+    if (!Object.values(answers.roles).some(role => role?.skills !== undefined)) throw new Error('请至少填写一行项目使用的 CLI 和模型');
+    config.active = false;
+  }
   for (const [name, role] of enabled) {
     if (role.inherit) {
       if (!Object.hasOwn(bindings, role.inherit)) throw new Error(`${name} 缺少继承的身份 ${role.inherit}`);
@@ -159,7 +168,11 @@ try {
       console.log(JSON.stringify({ ...saved.config, tools, roles: configuredRoles(saved.config) }));
       break;
     }
-    case 'form': console.log(form(readRouting(projectConfigPath(projectRoot(values))).config)); break;
+    case 'form': {
+      const names = positionals.slice(1).flatMap(value => value.split(',')).filter(Boolean);
+      console.log(form(readRouting(projectConfigPath(projectRoot(values))).config, names));
+      break;
+    }
     case 'tools': console.log(Object.entries(template.tools).map(([id, t]) => [id, ...(t.aliases ?? [])].join(' / ')).join('\n')); break;
     case 'adapter': {
       const id = toolId(template.tools, positionals[1]);
@@ -173,7 +186,7 @@ try {
       console.log(`${changed ? '已保存' : '已是所选配置'} ${file}`);
       break;
     }
-    default: throw new Error('用法：setup.mjs form|tools|adapter CLI|apply [--project DIR]');
+    default: throw new Error('用法：setup.mjs form [身份,…] | tools | adapter CLI | apply [--project DIR]');
   }
 } catch (err) {
   process.stderr.write(`herdr-setup: ${err.message}\n`);

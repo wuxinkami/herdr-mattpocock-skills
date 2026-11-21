@@ -11,6 +11,17 @@ export function projectRoot({ project } = {}) {
 export const projectConfigPath = project => path.join(project, '.agents', 'herdr', 'routing.json');
 export const isSet = v => typeof v === 'string' && v.trim() !== '' && !['default', 'inherit', 'current'].includes(v);
 export const isRolePlaceholder = role => role?.tool === '' && role.model === '' && !role.inherit && role.enabled === undefined;
+const formerGrillRoles = ['wayfinder', 'griller', 'spec-writer'];
+const retiredRoles = new Set([...formerGrillRoles, 'checker', 'worker']);
+export const currentRole = name => formerGrillRoles.includes(name) ? 'grill' : name;
+
+export function roleSkills(value) {
+  const names = typeof value === 'string' ? (value.trim() ? value.split(',') : []) : value;
+  if (!Array.isArray(names)) throw new Error('skills 需要技能名称列表');
+  const skills = names.map(name => typeof name === 'string' ? name.trim().replace(/^[$\/]/, '') : '');
+  if (skills.some(name => !name || /[\s,$]/.test(name))) throw new Error('请填写有效的技能名称，多个技能用逗号分隔');
+  return [...new Set(skills)];
+}
 
 export function readRouting(file) {
   let config;
@@ -29,22 +40,29 @@ export function readRouting(file) {
 
 // 迁移旧身份时，保留仍在用的身份所继承的项目路由。
 export function configuredRoles(config, { includePlaceholders = false } = {}) {
-  const entries = Object.entries(config.roles ?? {}).filter(([, role]) => includePlaceholders || !isRolePlaceholder(role));
+  const entries = Object.entries(config.roles ?? {}).filter(([, role]) => includePlaceholders || !isRolePlaceholder(role) || role.skills !== undefined);
   const roles = structuredClone(Object.fromEntries(entries));
-  if (roles.griller) roles.wayfinder ??= roles.griller;
+  const candidates = [roles.grill, ...formerGrillRoles.map(name => roles[name])].filter(Boolean);
+  if (candidates.length) {
+    const binding = candidates.find(role => !isRolePlaceholder(role)) ?? candidates[0];
+    roles.grill = { ...binding, ...(roles.grill?.skills !== undefined && { skills: roles.grill.skills }) };
+  }
   for (const role of Object.values(roles)) {
-    if (role.inherit === 'griller') role.inherit = 'wayfinder';
-    if (['checker', 'worker'].includes(role.inherit) && roles[role.inherit]) {
+    // 旧身份合并后，原本继承不同型号的其他成员仍使用原来的启动配置。
+    const visited = new Set();
+    while (retiredRoles.has(role.inherit) && roles[role.inherit]) {
+      if (visited.has(role.inherit)) throw new Error(`inherit 形成循环：${role.inherit}`);
+      visited.add(role.inherit);
       const parent = roles[role.inherit];
       for (const field of ['tool', 'model', 'effort']) role[field] ??= parent[field];
       if (parent.inherit) role.inherit = parent.inherit;
       else delete role.inherit;
     }
+    if (role.inherit) role.inherit = currentRole(role.inherit);
+    if (role.skills !== undefined) role.skills = roleSkills(role.skills);
     if (config.tools?.codex && toolId(config.tools, role.tool) === 'codex') role.tool = 'codex';
   }
-  delete roles.griller;
-  delete roles.checker;
-  delete roles.worker;
+  for (const name of retiredRoles) delete roles[name];
   return roles;
 }
 

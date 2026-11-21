@@ -7,7 +7,8 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { commandProblems, configuredRoles, configuredTools, isSet, modeOptions, projectConfigPath, projectRoot, readRouting, toolId } from './routing.mjs';
+import { isDeepStrictEqual } from 'node:util';
+import { commandProblems, configuredRoles, configuredTools, currentRole, isRolePlaceholder, isSet, modeOptions, projectConfigPath, projectRoot, readRouting, roleSkills, toolId } from './routing.mjs';
 import { isShortReference, loadReference, saveReference } from './references.mjs';
 import * as store from './store.mjs';
 
@@ -16,10 +17,10 @@ const SETUP_DIR = path.join(path.dirname(SKILL_DIR), 'herdr-setup');
 const HMS = path.join(SKILL_DIR, 'scripts', 'hms.mjs');
 const NAME_RE = /^[a-z][a-z0-9_-]{0,31}$/;
 const SESSION_UUID_RE = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
-const DEFAULT_MAIN = ['secretary', 'pm', 'backend'];
-const PANEL_ROLES = new Set(['pm', 'frontend', 'backend', 'wayfinder', 'spec-writer']);
+const PANEL_ROLES = new Set(['pm', 'frontend', 'backend', 'grill', 'prototype']);
+const DEVELOPMENT_ROLES = new Set(['pm', 'frontend', 'backend', 'merger']);
 const ROLE_USE = {
-  secretary: '用户沟通与建图', pm: '团队派工与收尾', wayfinder: '一张决策票', 'spec-writer': '规格与工单',
+  secretary: '用户指令与团队通信', pm: '团队派工与收尾', grill: '需求对齐、规格与工单', prototype: '原型验证',
   frontend: '前端实现', backend: '后端实现', searcher: '搜索与研究',
   reviewer: '审查', designer: '独立方案', merger: '授权合并',
 };
@@ -129,11 +130,12 @@ function projectModelChoices(bindings) {
 function overrideRoles(raw, sets, tools, before, choices) {
   const changes = new Map();
   for (const s of sets) {
-    const match = /^([a-z][\w-]*)\.(tool|model|effort|carrier|place|inherit)=(.+)$/.exec(s);
-    if (!match) throw new Error(`--set 的格式应为 role.field=value：${s}`);
-    const [, name, field, value] = match;
+    const match = /^([a-z][\w-]*)\.(tool|model|effort|carrier|place|inherit|skills)=(.*)$/.exec(s);
+    if (!match || (!match[3] && match[2] !== 'skills')) throw new Error(`--set 的格式应为 role.field=value：${s}`);
+    const [, inputName, field, value] = match;
+    const name = currentRole(inputName);
     if (!changes.has(name)) changes.set(name, {});
-    changes.get(name)[field] = value;
+    changes.get(name)[field] = field === 'skills' ? roleSkills(value) : field === 'inherit' ? currentRole(value) : value;
   }
   for (const [name, fields] of changes) {
     if (fields.tool) {
@@ -148,25 +150,28 @@ function overrideRoles(raw, sets, tools, before, choices) {
       }
     }
     const defaults = { carrier: PANEL_ROLES.has(name) ? 'herdr' : 'auto' };
+    if (name !== 'secretary' && Object.keys(fields).length === 1 && fields.skills !== undefined) Object.assign(defaults, { tool: '', model: '' });
     raw[name] = { ...(Object.hasOwn(raw, name) ? raw[name] : defaults), ...fields };
   }
   return raw;
 }
 
-function resolveBindings(raw, tools, host = {}, simpleMain = []) {
+function resolveBindings(raw, tools, host = {}) {
   const done = Object.create(null);
   const visit = (name, chain) => {
     if (done[name]) return done[name];
     if (chain.includes(name)) throw new Error(`inherit 形成循环：${[...chain, name].join(' -> ')}`);
-    const r = Object.hasOwn(raw, name) ? raw[name] : (simpleMain.includes(name) ? {} : undefined);
-    if (!r) throw new Error(`routing.json 没有配置身份 ${name}`);
+    const r = Object.hasOwn(raw, name) ? raw[name] : (name === 'secretary' ? {} : undefined);
+    if (!r || isRolePlaceholder(r)) throw new Error(`请用 $herdr-setup 补填 ${name} 的 CLI 和模型，或用 --set 指定本轮配置`);
     const { inherit, ...own } = r;
     let res = { ...own };
     if (inherit) {
       const p = visit(inherit, [...chain, name]);
       res = { tool: p.tool, model: p.model, effort: p.effort, ...own, inherits: inherit };
     }
-    if (name === 'secretary' || simpleMain.includes(name)) res = { ...res, tool: 'current', model: 'inherit', effort: 'inherit', carrier: 'current', mergedMain: simpleMain.includes(name) };
+    if (name === 'secretary') res = { ...res, tool: 'current', model: 'inherit', effort: 'inherit', carrier: 'current' };
+    else if (name === 'grill' || name === 'prototype') res.carrier = 'herdr';
+    else if (res.carrier === 'current') res.carrier = PANEL_ROLES.has(name) ? 'herdr' : 'auto';
     if (!res.tool && res.enabled !== false) throw new Error(`身份 ${name} 缺少 tool`);
     res.model ??= 'default';
     res.effort ||= 'high';
@@ -177,18 +182,20 @@ function resolveBindings(raw, tools, host = {}, simpleMain = []) {
     if (res.effort === 'inherit' && host.effort) res.effort = host.effort;
     return (done[name] = res);
   };
-  for (const name of new Set([...Object.keys(raw), ...simpleMain])) visit(name, []);
+  for (const name of new Set(['secretary', ...Object.keys(raw)])) {
+    if (!isRolePlaceholder(raw[name])) visit(name, []);
+  }
   return done;
 }
 
-export function resolveRoles(config, { sets = [], host = {}, simpleMain = [] } = {}) {
+export function resolveRoles(config, { sets = [], host = {} } = {}) {
   const raw = configuredRoles(config);
   const tools = toolsForOverrides(config.tools, sets);
   if (sets.length) {
     const before = resolveBindings(raw, tools);
     overrideRoles(raw, sets, tools, before, config.projectModels ?? projectModelChoices(before));
   }
-  return resolveBindings(raw, tools, host, simpleMain);
+  return resolveBindings(raw, tools, host);
 }
 
 export function checkRole(name, r, tools, caller) {
@@ -212,26 +219,28 @@ export function checkRole(name, r, tools, caller) {
   return problems;
 }
 
-export function makeSnapshot(config, { sets = [], mode = 'simple', host = {}, off = [], on = [], source = null, project = process.cwd() } = {}) {
+export function makeSnapshot(config, { sets = [], mode = 'complex', host = {}, off = [], on = [], source = null, project = process.cwd() } = {}) {
   if (mode !== 'simple' && mode !== 'complex') throw new Error(`未知模式 ${mode}`);
-  const simpleMain = mode === 'simple' ? DEFAULT_MAIN : [];
   const tools = toolsForOverrides(config.tools, sets);
   if (host.tool) host = { ...host, tool: toolId(tools, host.tool) ?? host.tool };
   const raw = configuredRoles(config);
   const before = resolveBindings(raw, tools);
   const projectModels = config.projectModels ?? projectModelChoices(before);
   const roleConfig = overrideRoles(raw, sets, tools, before, projectModels);
-  const required = new Set(config.required ?? []);
+  const required = new Set((config.required ?? []).map(currentRole));
   for (const [enabled, names] of [[false, off], [true, on]]) {
-    for (const n of names) {
+    for (const n of names.map(currentRole)) {
+      if (!enabled && n === 'secretary') throw new Error('启用 HMS 的主会话始终担任秘书');
       if (enabled) required.add(n); else required.delete(n);
-      if (Object.hasOwn(roleConfig, n)) roleConfig[n].enabled = enabled;
+      if (Object.hasOwn(roleConfig, n) && !isRolePlaceholder(roleConfig[n])) roleConfig[n].enabled = enabled;
     }
   }
-  const roles = resolveBindings(roleConfig, tools, host, simpleMain);
+  if ([...required].some(name => name !== 'pm' && DEVELOPMENT_ROLES.has(name))) required.add('pm');
+  const roles = resolveBindings(roleConfig, tools, host);
   return {
     schemaVersion: 6, createdAt: nowIso(), mode, project, projectModels,
-    configSource: source, host, simpleMain, roles, roleConfig, tools, required: [...required], confirmed: false,
+    configSource: source, host, roles, roleConfig, tools, required: [...required],
+    scoped: Boolean(config.scoped || on.length || required.size), confirmed: false,
   };
 }
 
@@ -239,28 +248,29 @@ const showVal = (v, label) => (v === 'default' ? `工具默认，${label}未核�
 const showTool = r => (r.tool === 'current' ? '当前会话（未知）' : r.tool);
 
 export function snapshotTable(s, selected) {
-  const names = selected ?? [...Object.keys(ROLE_USE).filter(n => s.roles[n]), ...Object.keys(s.roles).filter(n => !Object.hasOwn(ROLE_USE, n))];
-  const lines = ['| 身份 | 本轮用途 | 工具 | 模型 | 思考等级 | 执行方式 | 备注 |', '| --- | --- | --- | --- | --- | --- | --- |'];
-  for (const n of new Set([...(s.mode === 'complex' ? ['pm'] : []), ...(s.required ?? [])])) {
-    if (!s.roles[n]) lines.push(`| ${cell(n)} | ${ROLE_USE[n] ?? '本轮需要'} | 待填写 | 待填写 | 待填写 | — | 开发前补齐 |`);
-  }
-  for (const n of names) {
+  const names = selected ?? (s.scoped ? ['secretary', ...s.required] : Object.keys(s.roles));
+  const lines = ['| 身份 | 本轮用途 | 工具 | 模型 | 思考等级 | 执行方式 | 本轮技能 | 备注 |', '| --- | --- | --- | --- | --- | --- | --- | --- |'];
+  for (const n of new Set(names)) {
     const r = s.roles[n];
-    if (!r) continue;
-    if (r.enabled === false) { lines.push(`| ${n} | 本轮不启用 | — | — | — | — | |`); continue; }
+    const skills = cell((s.roleConfig?.[n]?.skills ?? r?.skills)?.join(', '));
+    if (!r) {
+      lines.push(`| ${cell(n)} | ${ROLE_USE[n] ?? '本轮需要'} | 待填写 | 待填写 | 待填写 | — | ${skills} | 派工前补齐 |`);
+      continue;
+    }
+    if (r.enabled === false) { lines.push(`| ${n} | 本轮不启用 | — | — | — | — | ${skills} | |`); continue; }
     const notes = checkRole(n, r, s.tools, s.host);
     if (r.carrier === 'auto' && r.tool === s.host.tool && isSet(r.model) && r.model === s.host.model && commandProblems(s.tools[r.tool], 'headless', r).length) notes.push('仅当原生子代理可落实此配置时可用');
     if (r.inherits) notes.push(`继承 ${r.inherits}`);
-    if (r.mergedMain) notes.push(`合并于当前主会话（${s.simpleMain.join(' + ')}）`);
     const mode = r.carrier === 'herdr' ? 'interactive' : r.carrier === 'background' ? 'headless' : null;
     const exe = mode && s.tools[r.tool]?.[mode]?.[0];
     if (exe && !onPath(executable(s.tools[r.tool], exe))) notes.push(`找不到可执行文件 ${exe}`);
-    lines.push(`| ${n} | ${ROLE_USE[n] ?? '自定义身份'} | ${cell(showTool(r))} | ${cell(showVal(r.model, '具体型号'))} | ${cell(showVal(r.effort, '等级'))} | ${CARRIER[r.carrier] ?? r.carrier} | ${cell(notes.join('；'))} |`);
+    lines.push(`| ${n} | ${ROLE_USE[n] ?? '自定义身份'} | ${cell(showTool(r))} | ${cell(showVal(r.model, '具体型号'))} | ${cell(showVal(r.effort, '等级'))} | ${CARRIER[r.carrier] ?? r.carrier} | ${skills} | ${cell(notes.join('；'))} |`);
   }
   return lines.join('\n');
 }
 
 const roleList = s => s ? s.split(',').map(n => n.trim()).filter(Boolean) : [];
+const overriddenRoles = sets => sets.map(setting => currentRole(setting.split('.')[0]));
 
 function snapshotFrom(o, project) {
   if (o.context) {
@@ -284,7 +294,10 @@ function snapshotFrom(o, project) {
     }
     snap.roleConfig = configuredRoles({ roles: snap.roleConfig, tools: snap.tools });
     snap.tools = configuredTools(snap.tools);
-    snap.roles = resolveBindings(snap.roleConfig, snap.tools, snap.host, snap.simpleMain);
+    delete snap.simpleMain;
+    snap.required = [...new Set((snap.required ?? []).map(currentRole))];
+    snap.scoped ??= false;
+    snap.roles = resolveBindings(snap.roleConfig, snap.tools, snap.host);
     if (snap.mode === 'complex' && o.record && path.resolve(o.record) !== snap.record) throw new Error('同一轮必须使用同一份团队成员表');
     // 旧版用表路径命名单例面板。保留这个键以便交接，简单模式不再读写旧表。
     snap.roundId ??= snap.record;
@@ -301,18 +314,26 @@ function snapshotFrom(o, project) {
       if (!(o._[0] === 'resolve' || (o._[0] === 'record' && ['update', 'confirm'].includes(o._[1])))) {
         throw new Error('使用 record update 更新本轮配置并传递新 context');
       }
-      let base = { roles: snap.roleConfig, tools: snap.tools, projectModels: snap.projectModels, required: snap.required };
+      let base = { roles: snap.roleConfig, tools: snap.tools, projectModels: snap.projectModels, required: snap.required, scoped: snap.scoped };
       // setup 可在本轮补填缺失身份；已有本轮绑定及临时覆盖仍优先。
       if ((promote || o.on) && readRouting(projectConfigPath(snap.project)).active) {
         const { config } = loadConfig({}, snap.project);
-        base = { ...base, roles: { ...configuredRoles(config), ...base.roles }, tools: { ...config.tools, ...base.tools },
-          projectModels: projectModelChoices(resolveBindings(configuredRoles(config), config.tools)) };
+        const projectRoles = configuredRoles(config);
+        const roles = { ...projectRoles, ...base.roles };
+        for (const [name, role] of Object.entries(base.roles)) {
+          if (isRolePlaceholder(role) && projectRoles[name]) roles[name] = { ...projectRoles[name], skills: role.skills };
+        }
+        base = { ...base, roles, tools: { ...config.tools, ...base.tools },
+          projectModels: projectModelChoices(resolveBindings(projectRoles, config.tools)) };
       }
       const next = makeSnapshot(base, {
         sets: o.set, on: roleList(o.on), off: roleList(o.off), mode: o.mode ?? snap.mode, host: snap.host, project: snap.project, source: snap.configSource,
       });
-      const changed = [...new Set([...Object.keys(next.roles), ...(snap.required ?? []), ...next.required])].filter(n =>
-        JSON.stringify(next.roles[n]) !== JSON.stringify(snap.roles[n]) || (snap.required ?? []).includes(n) !== next.required.includes(n));
+      const considered = next.scoped
+        ? [...snap.required, ...next.required, ...roleList(o.off).map(currentRole), ...overriddenRoles(o.set)]
+        : [...Object.keys(next.roleConfig), ...Object.keys(snap.roleConfig)];
+      const changed = [...new Set(considered)].filter(n =>
+        !isDeepStrictEqual(next.roles[n] ?? next.roleConfig[n], snap.roles[n] ?? snap.roleConfig[n]) || snap.required.includes(n) !== next.required.includes(n));
       const previousPanels = { ...snap.previousPanels };
       const handoffs = new Set(changed);
       if (promote) handoffs.add('frontend');
@@ -328,7 +349,9 @@ function snapshotFrom(o, project) {
   }
   const { file, config } = loadConfig(o, project);
   const host = currentHost(o, config.tools);
-  return { snap: makeSnapshot(config, { sets: o.set, mode: o.mode, host, off: roleList(o.off), on: roleList(o.on), source: file, project }) };
+  // 默认从秘书开始分阶段核对。显式指定旧模式的调用仍可一次核对整个项目团队。
+  const scoped = config.scoped || o.mode === undefined;
+  return { snap: makeSnapshot({ ...config, scoped }, { sets: o.set, mode: o.mode, host, off: roleList(o.off), on: roleList(o.on), source: file, project }) };
 }
 
 function saveContext(snap) {
@@ -351,23 +374,25 @@ function roleOf(snap, role, carrier, fresh = false) {
   return r;
 }
 
-function launchSnapshot(snap, role, { routeFrom, headless, fresh }) {
+function launchSnapshot(snap, role, { routeFrom, headless, fresh, legacyPrototype }) {
   if (routeFrom === undefined) return snap;
-  if (role !== 'wayfinder' || headless || fresh) {
-    throw new Error('--route-from 用于 argv wayfinder 和 spawn wayfinder 的显式面板');
+  if (role !== 'prototype' || headless || fresh) {
+    throw new Error('--route-from 用于原型票的显式面板');
   }
   const { config } = loadConfig({}, snap.project);
   const tools = configuredTools(config.tools);
   const route = resolveBindings(configuredRoles(config), tools, snap.host)[routeFrom];
   if (!route?.tool) throw new Error(`项目角色 ${routeFrom} 没有可借用的启动配置`);
   const { tool, model, effort } = route;
-  const target = snap.roles[role];
+  const target = snap.roles[role] ?? (legacyPrototype && snap.roles.grill ? { carrier: 'herdr', enabled: snap.roles.grill.enabled } : undefined);
   return { ...snap, tools, roles: { ...snap.roles, [role]: target && { ...target, tool, model, effort } } };
 }
 
 function requireDevelopmentApproval(snap, role) {
-  if (role === 'wayfinder' && snap.mode !== 'complex') throw new Error('HMS 内使用 wayfinder，先用 record update --context C --mode complex 转团队');
-  if (snap.mode === 'complex' && !snap.confirmed && ['pm', 'frontend', 'backend', 'merger'].includes(role)) {
+  if (snap.scoped && (!snap.confirmed || !snap.required.includes(role))) {
+    throw new Error(`请先核对本阶段的 ${role} 身份，用 record update --on ${role} --confirmed 记录答复`);
+  }
+  if (snap.mode === 'complex' && !snap.confirmed && DEVELOPMENT_ROLES.has(role)) {
     throw new Error('团队开发派工前，秘书须取得用户的配置确认');
   }
 }
@@ -484,6 +509,10 @@ function dispatchPrompt(snap, { context, role, task, parent, self, cwd, body }) 
   const projectRules = path.join(snap.project, 'AGENTS.md');
   const hms = 'node ' + shellQuote(HMS);
   const lines = [`${role} · ${task}`];
+  const skills = snap.roleConfig[role]?.skills;
+  if (skills?.length) {
+    lines.push('本次任务使用下列技能', skills.map(name => '$' + name).join(' '), '宿主未展开技能时，读取对应的已安装 SKILL.md。');
+  }
   if (duties) lines.push(duties);
   if (fs.existsSync(projectRules)) lines.push(`仅当任务属于该主仓或其 worktree 且宿主尚未加载时读 ${projectRules}。`);
   if (cwd) lines.push(`本任务工作目录：${cwd}`);
@@ -1089,7 +1118,8 @@ export function executionMetadata(stdout = '', stderr = '', tool) {
 function cmdResolve(o) {
   const { snap, changed } = snapshotFrom(o, projectRoot(o));
   const problems = developmentProblems(snap);
-  out(o.json ? snap : `${snapshotTable(snap, changed)}\n\n模式：${snap.mode}　配置来源：${snap.configSource ?? '本轮配置'}`);
+  const selected = changed ?? (snap.scoped ? ['secretary', ...snap.required, ...overriddenRoles(o.set)] : undefined);
+  out(o.json ? snap : `${snapshotTable(snap, selected)}\n\n模式：${snap.mode}　配置来源：${snap.configSource ?? '本轮配置'}`);
   if (problems.length) {
     process.stderr.write(problems.join('\n') + '\n');
     process.exitCode = 2;
@@ -1108,7 +1138,7 @@ function cmdArgv(o) {
 }
 
 function singletonRole(mode, role) {
-  return (mode === 'simple' && role === 'frontend') || (mode === 'complex' && role === 'pm');
+  return role === 'pm' || (mode === 'simple' && role === 'frontend');
 }
 
 function singletonName(roundId, role, config) {
@@ -1579,11 +1609,13 @@ function cmdRecover(o) {
 }
 
 function developmentProblems(snap) {
-  const issues = Object.entries(snap.roles).flatMap(([n, r]) => checkRole(n, r, snap.tools, snap.host).map(p => `${n}: ${p}`));
-  if (snap.mode === 'complex' && (!snap.roles.pm || snap.roles.pm.enabled === false || snap.roles.pm.carrier !== 'herdr')) {
+  const names = snap.scoped ? snap.required : Object.keys(snap.roles);
+  const issues = names.flatMap(n => snap.roles[n] ? checkRole(n, snap.roles[n], snap.tools, snap.host).map(p => `${n}: ${p}`)
+    : [`本轮需要 ${n}，请用 $herdr-setup 补这一行的 CLI 和模型，或用 --set 指定本轮配置`]);
+  if (snap.mode === 'complex' && names.some(n => DEVELOPMENT_ROLES.has(n) && snap.roles[n]?.enabled !== false)
+      && (!snap.roles.pm || snap.roles.pm.enabled === false || snap.roles.pm.carrier !== 'herdr')) {
     issues.unshift('团队开发需要一个已配置的显式 PM。请补 pm 的工具、模型和等级');
   }
-  for (const n of snap.required ?? []) if (!snap.roles[n] && n !== 'pm') issues.push(`本轮需要 ${n}，请补该身份的工具、型号和等级`);
   return issues;
 }
 
@@ -1676,6 +1708,7 @@ const HELP = `hms — Herdr 角色调度
   config [--project DIR]                                查询项目激活状态
   resolve [--mode simple|complex] [--host T --host-model M --host-effort E] [--set role.field=value] [--on a,b] [--off a,b]
   resolve --context C --set role.model=M                 仅展示受影响的身份
+  resolve --context C --set ROLE.skills=SKILL1,SKILL2     预览该身份的本轮技能，可重复 --set 来配置多个身份
   init [--title 简称] [同 resolve 的配置] [--session-id ID] [--confirmed 用户答复]
                                                         返回本轮短 ID，团队模式建库及会话索引
   record confirm --context C --confirmed 用户答复         确认本轮配置，返回新 context
@@ -1694,12 +1727,17 @@ const HELP = `hms — Herdr 角色调度
 
 --context 使用本轮 ctx:… 短 ID，--parent / --to 和面板管理使用 hms:… 短 ID。
 where 核对当前发起面板，spawn 重新核对并在同一标签页分屏。--herdr-session 指定 Herdr 会话名，--session-id 指 agent 原生会话 ID。
---route-from ROLE 为当前 Wayfinder 票读取项目 roles.ROLE 的工具、模型和等级。
+默认由主会话担任秘书，--on 指定当前阶段需要的身份。附加技能写进受派成员的首条消息。
+--route-from ROLE 为显式 prototype 面板借用项目 roles.ROLE 的工具、模型和等级。
 --fresh 用项目的 frontend 或 backend 配置，在本票 worktree 开显式新面板。--project DIR 指定主项目。`;
 
 export function main(argv) {
   const o = parseArgs(argv);
   const cmd = o._[0];
+  if (['argv', 'spawn', 'native', 'run'].includes(cmd)) {
+    o.legacyPrototype = o._[1] === 'wayfinder' && o.routeFrom !== undefined;
+    o._[1] = o.legacyPrototype ? 'prototype' : currentRole(o._[1]);
+  }
   const table = { init: initRound, resolve: cmdResolve, argv: cmdArgv, where: cmdWhere, spawn: cmdSpawn, prompt: cmdPrompt, native: cmdNative, run: cmdRun, notify: cmdNotify, close: cmdClose, ls: cmdLs, record: cmdRecord, recover: cmdRecover };
   if (!cmd || o.help || cmd === 'help') return out(HELP);
   if (cmd === 'config') {
@@ -1711,7 +1749,7 @@ export function main(argv) {
     if (o[key] !== undefined) throw new Error(`不再支持 --${key} 文件通信；使用 --context / --prompt 直接传递正文，输出直接返回调用方`);
   }
   if (o.session !== undefined) throw new Error('用 --herdr-session 指定 Herdr 会话名称，用 --session-id 指定 agent 原生会话 ID');
-  if (o.routeFrom !== undefined && !['argv', 'spawn'].includes(cmd)) throw new Error('--route-from 用于 argv wayfinder 和 spawn wayfinder');
+  if (o.routeFrom !== undefined && !['argv', 'spawn'].includes(cmd)) throw new Error('--route-from 用于 argv prototype 和 spawn prototype');
   if (!table[cmd]) throw new Error(`未知命令 ${cmd}；运行 hms help 查看用法`);
   return table[cmd](o);
 }

@@ -8,65 +8,60 @@ disable-model-invocation: true
 
 本页是 HMS 的操作入口，已加载即可直接用。以下 `hms` 指 `node "<本技能目录>/scripts/hms.mjs"`，在目标项目运行。配置以命令输出为准，成员职责随派工正文送达。
 
-## 开一轮
+## 秘书与派工
 
-有本轮 `ctx:…` 短 ID 就沿用，传给 `--context`。首次调用运行 `hms config`，已激活即按所选模式继续，未激活才按返回的 `skillFile` 调用 `$herdr-setup`。
+用户在主会话明确启用 HMS 后，最初的主 agent 在该会话及其恢复会话里始终担任秘书。尚未启用 HMS 时，单独点名 Matt 技能就按原技能执行。收到带身份、任务和回报地址的派工时，沿用受派身份。
 
-**简单模式（默认）**。主 agent 对话、做后端和调度。首次派工用 `hms init --title "$title"`，取返回的 `context`。有前端任务才 `spawn frontend`，同轮复用，做完由主 agent 关闭。
+秘书接收用户指令、调度面板、广播意图和收回报。用户在秘书处点名技能时，把原请求和技能名交给对应身份，即使宿主已经展开了技能正文。用户在负责该需求的面板里点下一步时，由原 agent 继续。广播给多个成员时，按本轮实际接收者逐个 `hms prompt`，匿名成员由发起者传达。
 
-**团队模式**。用户说「团队」「多 agent」，或本轮 HMS 使用 wayfinder 时，当前 agent 任秘书。开发前展示本轮所需角色（含匿名角色）的 CLI、模型和等级，确认后开唯一 PM 按票派工。纯前端票由前端主责，含后端的票由后端主责，跨端在本票 worktree 依序交接。下例只派前端。
+| 用户要做的事 | 执行者与会话 |
+| --- | --- |
+| `grill-me`、`grill-with-docs`、`grilling`、`to-spec`、`to-tickets` | 开显式 `grill` 面板，由用户在里面直接回答。跟进同一需求时复用原面板。 |
+| 用 `wayfinder` 建图 | 开 `grill` 面板，按 Matt 建图、派所需 research，建图后向秘书回报并停下。 |
+| 用户要求推进 map | 按当前票的 `wayfinder:<type>` 标签派工。只给 map 时选下一张可办的票。每张普通决策票开新的 `grill` 显式面板，原型票直接开一个新的 `prototype` 面板，research 走 `searcher`。首条派工带上 `wayfinder`、map、当前票。整图收敛后，由一个 `grill` 会话读取主 map 和关联决策，依用户要求写规格、拆票。 |
+| 独立做原型，或某个设计问题要看原型 | 秘书、PM 或需求对齐面板可派显式 `prototype`。在原型面板体验并确认，结果与原型引用回到发起者。 |
+| `implement` 或 `implement-spec` | 由秘书派全队唯一的显式 PM，再由 PM 调度本票所需的实现者。研究用 `searcher`，独立评审用 `reviewer`，独立方案用 `designer`，工作流要求独立合并时用 `merger`。 |
+
+访谈结束后保留原面板，用户可在同一条对话中继续写规格或拆票。`grill` 将已发布的规格和开发票入口回报秘书。秘书请用户选择按票实现、整组实现或收尾。用户已选实施方式时直接带着选择和产物派 PM。
+
+## 开工身份表与本轮技能
+
+开工前，用户可为任意身份指定本轮使用的一个或多个技能。将用户指定的技能名填入该身份的「本轮技能」栏，可一次登记多个身份，也可提前填写尚未启用的身份。用户明确要求长期使用时，再通过 `$herdr-setup` 将同一选择保存为项目默认。
+
+秘书或 PM 开窗口时，HMS 将接收身份选定的每个技能以 `$技能名` 写入首条派工消息，与任务正文一起发送。秘书自身的本轮技能在当前主会话使用。
+
+首次派工运行 `hms config`，已有本轮 `ctx:…` 就沿用。按阶段只核对新增或变更的身份、CLI、模型、思考等级和本轮技能，用户亲自点名的配置计作该项确认。项目缺少本次要用的身份时，用 `$herdr-setup` 的 `form 身份` 补该行，也可用 `--set 身份.tool=CLI --set 身份.model=型号` 只配置本轮。
 
 ```bash
-team_opts=(--mode complex --on pm,frontend --off wayfinder,spec-writer,backend,searcher,reviewer,designer,merger)
-hms resolve "${team_opts[@]}"
-# 用户确认后，沿用刚展示的选项
-context=$(hms init "${team_opts[@]}" --title "$title" --confirmed "$reply" | jq -er '.context')
+opts=(--on "$active_roles")
+# 用户每指定一行，就按实际身份和技能名追加一次；多个技能用逗号分隔
+if [[ -n "${assigned_role:-}" ]]; then
+  opts+=(--set "${assigned_role}.skills=${skill_names}")
+fi
+hms resolve "${opts[@]}"
+context=$(hms init "${opts[@]}" --title "$title" --confirmed "$reply" | jq -er '.context')
 hms where
-# 核对发起面板坐标后派工
-hms spawn pm --context "$context" --task "$task" --prompt "$prompt"
+hms spawn "$target_role" --context "$context" --task "$task" --prompt "$prompt"
 ```
 
-`--on` 标记必需角色，`--off` 停用本轮不用的角色。缺少路由时用 `$herdr-setup` 补项目默认值，或用 `--set` 临时指定。已知宿主配置可传 `--host "$tool" --host-model "$model" --host-effort "$effort"`。
-
-任务使用 Matt 时，由对应技能决定步骤、独立性和完成条件。只建 map 时用 `hms init --mode complex --title "$title"` 加所需角色，派 searcher 做 research，建完即停。用户要求串行推进时，秘书逐票开 wayfinder，传技能、map 和 ticket。审查用 reviewer，独立方案用 designer，流程要求独立合并时由 PM 在用户授权内派 merger。
-
-## 从决策到开发工单
-
-1. 用户要求把已定决策转成规格和开发工单时，秘书用 `--on spec-writer` 预览并更新本轮配置。项目路由缺这一行时用 `$herdr-setup` 补填，临时选择用 `--set`。取新 `context`，用 `hms spawn spec-writer --context "$context" --task "$task" --prompt "$prompt"` 开面板。正文附 `to-spec`、`to-tickets` 的技能引用、已确认的决策和相关原型。有 Wayfinder map 时附 map 链接，规格编写者按链接读取决策票结论。
-2. `spec-writer` 在同一面板依序完成 `to-spec` 和 `to-tickets`，当面和用户核对测试切入点、工单拆分及阻塞关系。两项产物发布后，用 `notify` 向秘书回报规格和开发工单入口，可用 Issue 链接或本地路径。
-3. 秘书收到回报后，按本轮开发配置确认，用 `spawn pm` 将两个引用和 `implement-spec` 技能交给 PM。PM 按工单依赖推进实现。
+同轮更改时用 `hms resolve --context "$context"` 预览，给 `hms record update --context "$context" --confirmed "$reply"` 传相同选项。用 `--set "${assigned_role}.skills="` 清空该身份的本轮列表，`--on`、`--off` 控制本轮启用的身份。将返回的新 context 传给仍在派工的成员。
 
 ## 派工与回报
 
-秘书或简单模式主 agent 每次开显式面板前都先运行 `hms where`，确认输出里的 `herdrSession`、`workspace`、`tab` 和 `pane` 是自己的坐标，再用 `hms spawn` 派工。`spawn` 会重新核对并在该面板旁分屏。`where` 失败时按提示修正后重试。
+每次开显式面板前先运行 `hms where`，确认输出的 `herdrSession`、`workspace`、`tab`、`pane` 是发起者自己的坐标。再用 `spawn` 在该面板旁开分屏。面板地址可用于续发和关闭。
 
 ```bash
 hms where
-# 核对发起面板坐标后派工
 hms spawn "$role" --context "$context" --task "$task" --prompt "$prompt"
 hms prompt "$address" --prompt "$prompt"
 hms notify --to "$reply_address" --task "$task" --role "$role" --status completed --summary "$summary"
 hms close "$address"
 ```
 
-秘书按票的产物选启动配置。页面或前端交互原型用 `--route-from frontend`，从主项目的 `roles.frontend` 读取 CLI、模型和等级，即使本轮已 `--off frontend`。其他原型可借用与工作性质相符的项目角色配置。普通 grilling 直接用 Wayfinder 的配置。两张票可以沿用同一 context，各自选参数。
-
-```bash
-hms argv wayfinder --context "$context" --route-from frontend
-hms where
-# 核对坐标后派页面原型票
-hms spawn wayfinder --context "$context" --task "$prototype_ticket" --route-from frontend --prompt "$prototype_prompt"
-hms where
-# 核对坐标后派普通 grilling 票
-hms spawn wayfinder --context "$context" --task "$grilling_ticket" --prompt "$grilling_prompt"
-```
-
-正文附 wayfinder 技能、map 和对应票。页面原型会话以 Wayfinder 身份认领、讨论原型、请用户确认、关票、更新 map 并向秘书回报。
-
 - `spawn` 在发起面板所属的 Herdr 会话、工作区和标签页分屏。返回的 `address` 是绑定 socket 和面板的 `hms:…` 短 ID，用于续发或关闭。`delivered: false` 时先处理面板等待项，再用 `prompt` 补发返回的完整正文。再派工和回报照抄收到的 `--parent` 和 `--to` 短 ID。票级新实现者加 `--fresh --cwd "$worktree"`，沿用本轮 context。查主项目配置加 `--project "$project"`。
 - 团队显式成员在 Herdr 观察到首条任务活动并取得原生会话 ID 后登记，处理等待项后用原地址补发同样适用。首条任务确认超时时，先检查面板是否已收到任务或留下草稿。任务已开始且返回 `recorded: false` 时，核实 ID 后用 `record add --run "$run"` 补登。
 - 用任务正文附带的 `notify` 回报，状态可填 `completed`、`blocked`、`failed`。团队回报先入库，再投递给发起者。发起者等待审批时最多等一分钟，超时可使用原命令重发。
-- 等发送方结束回合后关闭，由各发起者关闭自己调度的面板。借用面板保留，明确移交管理时用 `hms close "$pane" --takeover`。
+- 由发起者在该任务收尾后关闭自己调度的面板。`grill` 访谈结束时保留原对话，供用户继续写规格、拆票或明确收尾。借用面板保留，明确移交管理时用 `hms close "$pane" --takeover`。
 
 ## 匿名派工
 
@@ -89,6 +84,6 @@ hms record add --context "$context" --role "$role" --tool "$tool" --session-id "
 
 - 用 `hms resolve --context "$context"` 加 `--set 角色.tool=CLI`、`--set 角色.model=型号`、`--set 角色.effort=等级` 或 `--on`、`--off` 预览变更。临时换 CLI 沿用项目为该 CLI 配置的唯一型号，否则问一次，可选 `default`。
 - 用 `hms record update --context "$context" --confirmed "$reply"` 加相同选项更新。已经确认的团队只补确认变化项，用户点名即确认。只登记答复用 `hms record confirm --context "$context" --confirmed "$reply"`。以后续返回的 context 为准。
-- 简单模式转团队用 `hms record update --context "$context" --mode complex` 并带上所需角色，沿用临时配置。展示配置并确认，原前端交接后再开 PM。
+- 旧的简单模式 context 可用 `hms record update --context "$context" --mode complex` 加本阶段所需身份接入团队台账。
 - 手动启动的 Codex 使用共享 app-server 时，HMS 用当前线程 ID 匹配各 Herdr 会话的可见状态栏。定位失败时请用户在当前 Codex 的 `/statusline` 启用 `thread-id` 并移到最前，让完整 ID 显示在面板底部，然后运行 `hms where`。`--herdr-session` 是 Herdr 会话名，如 `main`。`--parent` 接受 `where` 返回的地址或面板 ID。`--session-id` 是 agent 的原生会话 ID。旧地址缺少 socket 时，可用 `--herdr-session` 指定对应会话。
 - 查启动参数用 `hms argv "$role" --context "$context"`，可加 `--headless` 或 `--fresh`。

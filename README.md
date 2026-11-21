@@ -17,7 +17,9 @@ npx herdr-mattpocock-skills install --agent codex --global
 
 安装包含同仓的两个技能。首次引用 HMS 时按表填写项目所用的 CLI、模型和思考等级（默认 `high`）。`$herdr-setup` 将选择写入 `.agents/herdr/routing.json`，也可随时调整项目默认值。
 
-Codex 和通用 `agents` 共用 `.agents/skills`，共享路径只安装一次。引用 `$herdr-mattpocock-skills` 默认简单模式，本轮要求团队、多 agent 或使用 wayfinder 时转团队。口头覆盖仅本轮生效。
+Codex 和通用 `agents` 共用 `.agents/skills`，共享路径只安装一次。用户明确启用 `$herdr-mattpocock-skills` 后，主会话始终担任秘书。需求访谈、写规格和拆票由同一显式 `grill` 面板承接。原型有独立的 `prototype` 面板。秘书收到开发票后请用户选择实施方式，再交 PM 调度。
+
+开工前可在身份表为任意身份指定一个或多个本轮技能。秘书或 PM 开窗口时，首条派工消息会引用接收身份选定的每个技能。后续只核对新增或变更的行。明确要求长期使用时才保存为项目默认值。
 
 团队记录使用项目本地 SQLite。运行环境需要 Node.js 20 或更新版本。Node 未提供 `node:sqlite` 时，使用 PATH 上的 `sqlite3`（3.38 或更新版本）。
 

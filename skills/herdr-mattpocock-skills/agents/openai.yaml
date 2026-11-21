@@ -1,6 +1,6 @@
 interface:
   display_name: "HMS"
-  short_description: "按职责配置工具、模型与思考等级，在 Herdr 中调度各个 agent"
+  short_description: "由主会话担任秘书，按身份派工到 Herdr 面板并收回报"
   default_prompt: "使用 $herdr-mattpocock-skills 调度本次任务。"
 policy:
   allow_implicit_invocation: false
